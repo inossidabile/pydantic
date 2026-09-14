@@ -6,7 +6,7 @@ use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyAttributeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedStr;
-use pyo3::types::{PyDict, PyList, PyMapping, PyString};
+use pyo3::types::{PyDict, PyEllipsis, PyList, PyMapping, PyString, PyTuple};
 
 use jiter::{JsonObject, JsonValue};
 use smallvec::SmallVec;
@@ -94,7 +94,7 @@ impl LookupPath {
     }
 
     pub fn py_get_dict_item<'py>(&self, dict: &Bound<'py, PyDict>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        self.get_impl(dict, PyDictMethods::get_item, |d, loc| Ok(loc.py_get_item(&d)))
+        self.get_impl(dict, PyDictMethods::get_item, |d, loc| Ok(loc.py_get_item(d)))
     }
 
     pub fn py_get_string_mapping_item<'py>(&self, dict: &Bound<'py, PyDict>) -> ValResult<Option<StringMapping<'py>>> {
@@ -107,11 +107,11 @@ impl LookupPath {
     }
 
     pub fn py_get_mapping_item<'py>(&self, dict: &Bound<'py, PyMapping>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        self.get_impl(dict, mapping_get, |d, loc| Ok(loc.py_get_item(&d)))
+        self.get_impl(dict, mapping_get, |d, loc| Ok(loc.py_get_item(d)))
     }
 
     pub fn simple_py_get_attr<'py>(&self, obj: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        self.get_impl(obj, py_get_attrs, |d, loc| loc.py_get_attrs(&d))
+        self.get_impl(obj, py_get_attrs, |d, loc| loc.py_get_attrs(d))
     }
 
     pub fn py_get_attr<'py>(
@@ -137,43 +137,32 @@ impl LookupPath {
         }
     }
 
-    pub fn json_get<'a, 'data>(&self, dict: &'a JsonObject<'data>) -> ValResult<Option<&'a JsonValue<'data>>> {
+    pub fn json_get<'data>(&self, dict: &JsonObject<'data>) -> ValResult<Option<JsonValue<'data>>> {
         // FIXME: use of find_map in here probably leads to quadratic complexity
 
         // first step is different as the first step is a key lookup
-        if let Some(v) = dict
+        let Some(first) = dict
             .iter()
             .rev()
             .find_map(|(k, v)| (k == self.first_key()).then_some(v))
-        // fold the rest of the path over the found value
-            && let Some(v) = self.rest.iter().try_fold(v, |d, loc| loc.json_get(d))
-        {
-            return Ok(Some(v));
-        }
-
-        Ok(None)
-    }
-
-    fn get_impl<'s, 'a, SourceT, OutputT: 'a>(
-        &'s self,
-        source: &'a SourceT,
-        lookup: impl Fn(&'a SourceT, &'s PathItemString) -> PyResult<Option<OutputT>>,
-        nested_lookup: impl Fn(OutputT, &'s PathItem) -> PyResult<Option<OutputT>>,
-    ) -> PyResult<Option<OutputT>> {
-        let Some(mut value) = lookup(source, &self.first_item)? else {
+        else {
             return Ok(None);
         };
 
-        // iterate over the path and plug each value into the value from the last step
-        for loc in &self.rest {
-            value = match nested_lookup(value, loc)? {
-                Some(v) => v,
-                None => return Ok(None),
-            }
-        }
+        Ok(json_apply_rest(first, &self.rest))
+    }
 
-        // Successfully found an item, return it
-        Ok(Some(value))
+    fn get_impl<'s, 'a, 'py, SourceT>(
+        &'s self,
+        source: &'a SourceT,
+        lookup: impl Fn(&'a SourceT, &'s PathItemString) -> PyResult<Option<Bound<'py, PyAny>>>,
+        nested_lookup: impl Fn(&Bound<'py, PyAny>, &'s PathItem) -> PyResult<Option<Bound<'py, PyAny>>>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let Some(first) = lookup(source, &self.first_item)? else {
+            return Ok(None);
+        };
+
+        py_apply_rest(first, &self.rest, &nested_lookup)
     }
 
     pub fn loc(&self) -> Location {
@@ -211,6 +200,73 @@ impl LookupPath {
     pub fn rest(&self) -> &[PathItem] {
         &self.rest
     }
+
+    /// Whether this path contains a [`PathItem::Wildcard`] (`...`) anywhere after the first item.
+    pub fn has_wildcard(&self) -> bool {
+        self.rest.iter().any(|item| matches!(item, PathItem::Wildcard))
+    }
+}
+
+/// Apply the rest of a lookup path (after the initial key lookup) to a Python value.
+///
+/// When `rest` starts with [`PathItem::Wildcard`], `value` must be a `list` or `tuple`; the remainder
+/// of the path (`tail`) is applied to every element and the results (using `None` for elements where
+/// `tail` doesn't resolve) are collected into a new list, rather than pointing at a single existing value.
+fn py_apply_rest<'s, 'py>(
+    value: Bound<'py, PyAny>,
+    rest: &'s [PathItem],
+    nested_lookup: &impl Fn(&Bound<'py, PyAny>, &'s PathItem) -> PyResult<Option<Bound<'py, PyAny>>>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some((first, tail)) = rest.split_first() else {
+        return Ok(Some(value));
+    };
+
+    if matches!(first, PathItem::Wildcard) {
+        let py = value.py();
+        let items: Vec<Bound<'py, PyAny>> = if let Ok(list) = value.cast::<PyList>() {
+            list.iter().collect()
+        } else if let Ok(tuple) = value.cast::<PyTuple>() {
+            tuple.iter().collect()
+        } else {
+            return Ok(None);
+        };
+
+        let mut results = Vec::with_capacity(items.len());
+        for item in items {
+            let mapped = py_apply_rest(item, tail, nested_lookup)?.unwrap_or_else(|| py.None().into_bound(py));
+            results.push(mapped);
+        }
+        return Ok(Some(PyList::new(py, results)?.into_any()));
+    }
+
+    match nested_lookup(&value, first)? {
+        Some(v) => py_apply_rest(v, tail, nested_lookup),
+        None => Ok(None),
+    }
+}
+
+/// Apply the rest of a lookup path (after the initial key lookup) to a JSON value, see [`py_apply_rest`].
+///
+/// `JsonValue` clones are cheap (an `Arc` bump for arrays/objects, or a `Cow` reference copy for strings),
+/// so cloning to detach from the borrowed input tree is not a performance concern here.
+fn json_apply_rest<'data>(value: &JsonValue<'data>, rest: &[PathItem]) -> Option<JsonValue<'data>> {
+    let Some((first, tail)) = rest.split_first() else {
+        return Some(value.clone());
+    };
+
+    if matches!(first, PathItem::Wildcard) {
+        let JsonValue::Array(arr) = value else {
+            return None;
+        };
+        let results: Vec<JsonValue<'data>> = arr
+            .iter()
+            .map(|item| json_apply_rest(item, tail).unwrap_or(JsonValue::Null))
+            .collect();
+        return Some(JsonValue::Array(std::sync::Arc::new(results)));
+    }
+
+    let next = first.json_get(value)?;
+    json_apply_rest(next, tail)
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +275,8 @@ pub(crate) enum PathItem {
     /// integer key, used to get items from a list, tuple OR a dict with int keys `dict[int, ...]` (python only)
     Pos(usize),
     Neg(usize),
+    /// `...`, used to map the rest of the path over every element of a list or tuple
+    Wildcard,
 }
 
 /// String type key, used to get or identify items from a dict or anything that implements `__getitem__`
@@ -254,6 +312,7 @@ impl fmt::Display for PathItem {
             Self::S(key) => key.fmt(f),
             Self::Pos(key) => write!(f, "{key}"),
             Self::Neg(key) => write!(f, "-{key}"),
+            Self::Wildcard => write!(f, "..."),
         }
     }
 }
@@ -271,6 +330,7 @@ impl<'py> IntoPyObject<'py> for &'_ PathItem {
                 let neg_value = -(*val as i64);
                 neg_value.into_bound_py_any(py)
             }
+            PathItem::Wildcard => Ok(PyEllipsis::get(py).to_owned().into_any()),
         }
     }
 }
@@ -294,13 +354,17 @@ impl PathItem {
             Err(e) => e.into_inner(),
         };
 
+        if obj.is_instance_of::<PyEllipsis>() {
+            return Ok(Self::Wildcard);
+        }
+
         if let Ok(usize_key) = obj.extract::<usize>() {
             Ok(Self::Pos(usize_key))
         } else if let Ok(int_key) = obj.extract::<isize>() {
             // usize has more possible positive values than isize, so guaranteed negative here
             Ok(Self::Neg(int_key.unsigned_abs()))
         } else {
-            py_err!(PyTypeError; "Item in an alias path should be a string or int")
+            py_err!(PyTypeError; "Item in an alias path should be a string, int, or `...`")
         }
     }
 
@@ -334,7 +398,7 @@ impl PathItem {
                         None
                     }
                 }
-                Self::S(..) => None,
+                Self::S(..) | Self::Wildcard => None,
             },
             _ => None,
         }
@@ -352,6 +416,7 @@ impl PathItem {
             Self::S(PathItemString(key)) => LocItem::from(key.clone()),
             Self::Pos(index) => LocItem::from(*index),
             Self::Neg(index) => LocItem::from(-(*index as i64)),
+            Self::Wildcard => LocItem::from("*".to_string()),
         }
     }
 }
@@ -386,6 +451,13 @@ impl LookupPathCollection {
         };
         let by_alias = validation_alias.map(ValidationAlias::into_paths).unwrap_or_default();
         Ok(Self { by_name, by_alias })
+    }
+
+    /// Whether any of the alias paths for this field contain a [`PathItem::Wildcard`] (`...`).
+    ///
+    /// `by_name` can never contain a wildcard, as it is always a plain field name.
+    pub fn has_wildcard(&self) -> bool {
+        self.by_alias.iter().any(LookupPath::has_wildcard)
     }
 
     /// Returns the lookup paths to use based on the provided `lookup_type`. At least one path will always be returned.

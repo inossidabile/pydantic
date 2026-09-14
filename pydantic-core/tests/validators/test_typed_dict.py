@@ -697,6 +697,129 @@ def test_alias_error_loc_alias(py_and_json: PyAndJson):
     ]
 
 
+@pytest.mark.olympus
+@pytest.mark.parametrize(
+    'input_value,expected',
+    [
+        ({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}, {'field_a': ['Alice', 'Bob']}),
+        ({'authors': []}, {'field_a': []}),
+        ({'authors': ({'name': 'Alice'},)}, {'field_a': ['Alice']}),
+        ({'authors': 'not-a-list'}, Err(r'authors\.\*\.name\n +Field required \[type=missing,')),
+        ({'authors': [{'name': 'Alice'}, {}]}, Err(r'Input should be a valid string')),
+    ],
+    ids=repr,
+)
+def test_alias_path_wildcard(py_and_json: PyAndJson, input_value, expected):
+    v = py_and_json(
+        {
+            'type': 'typed-dict',
+            'fields': {
+                'field_a': {
+                    'type': 'typed-dict-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    if isinstance(expected, Err):
+        with pytest.raises(ValidationError, match=expected.message):
+            v.validate_test(input_value)
+    else:
+        assert v.validate_test(input_value) == expected
+
+
+@pytest.mark.olympus
+def test_alias_path_wildcard_bare(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'typed-dict',
+            'fields': {
+                'field_a': {
+                    'type': 'typed-dict-field',
+                    'validation_alias': ['authors', ...],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'any'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}]}) == {'field_a': [{'name': 'Alice'}]}
+
+
+@pytest.mark.olympus
+def test_alias_path_wildcard_nested(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'typed-dict',
+            'fields': {
+                'field_a': {
+                    'type': 'typed-dict-field',
+                    'validation_alias': ['groups', ..., ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'list', 'items_schema': {'type': 'str'}}},
+                }
+            },
+        }
+    )
+    input_value = {'groups': [[{'name': 'A'}, {'name': 'B'}], [{'name': 'C'}]]}
+    assert v.validate_test(input_value) == {'field_a': [['A', 'B'], ['C']]}
+
+
+@pytest.mark.olympus
+def test_alias_choices_wildcard(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'typed-dict',
+            'fields': {
+                'field_a': {
+                    'type': 'typed-dict-field',
+                    'validation_alias': [['writers'], ['authors', ..., 'name']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'writers': ['X', 'Y'], 'authors': [{'name': 'A'}]}) == {'field_a': ['X', 'Y']}
+    assert v.validate_test({'authors': [{'name': 'A'}]}) == {'field_a': ['A']}
+
+
+@pytest.mark.olympus
+def test_alias_path_wildcard_error_loc(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'typed-dict',
+            'fields': {
+                'field_a': {
+                    'type': 'typed-dict-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        },
+        {'loc_by_alias': True},  # this is the default
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}) == {'field_a': ['Alice', 'Bob']}
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_test({'authors': [{'name': 'Alice'}, {}]})
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'string_type',
+            'loc': ('authors', '*', 'name', 1),
+            'msg': 'Input should be a valid string',
+            'input': None,
+        }
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_test({'authors': 'not-a-list'})
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'missing',
+            'loc': ('authors', '*', 'name'),
+            'msg': 'Field required',
+            'input': {'authors': 'not-a-list'},
+        }
+    ]
+
+
 def test_alias_error_loc_field_names(py_and_json: PyAndJson):
     v = py_and_json(
         {

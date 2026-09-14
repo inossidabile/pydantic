@@ -2599,7 +2599,7 @@ def _validators_require_validate_default(validators: Iterable[Decorator[Validato
 
 def _convert_to_aliases(
     alias: str | AliasChoices | AliasPath | None,
-) -> str | list[str | int] | list[list[str | int]] | None:
+) -> str | list[str | int | EllipsisType] | list[list[str | int | EllipsisType]] | None:
     if isinstance(alias, (AliasChoices, AliasPath)):
         return alias.convert_to_aliases()
     else:

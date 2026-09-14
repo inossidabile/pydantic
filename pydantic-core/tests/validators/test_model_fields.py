@@ -825,6 +825,245 @@ def test_alias_error_loc_alias(py_and_json: PyAndJson):
     ]
 
 
+@pytest.mark.olympus
+@pytest.mark.parametrize(
+    'input_value,expected',
+    [
+        ({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}, ({'field_a': ['Alice', 'Bob']}, None, {'field_a'})),
+        ({'authors': []}, ({'field_a': []}, None, {'field_a'})),
+        ({'authors': ({'name': 'Alice'},)}, ({'field_a': ['Alice']}, None, {'field_a'})),
+        ({'authors': 'not-a-list'}, Err(r'authors\.\*\.name\n +Field required \[type=missing,')),
+        ({'authors': [{'name': 'Alice'}, {}]}, Err(r'Input should be a valid string')),
+    ],
+    ids=repr,
+)
+def test_alias_path_wildcard(py_and_json: PyAndJson, input_value, expected):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    if isinstance(expected, Err):
+        with pytest.raises(ValidationError, match=expected.message):
+            v.validate_test(input_value)
+    else:
+        assert v.validate_test(input_value) == expected
+
+
+@pytest.mark.olympus
+def test_alias_path_wildcard_bare(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ...],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'any'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}]}) == ({'field_a': [{'name': 'Alice'}]}, None, {'field_a'})
+
+
+@pytest.mark.olympus
+def test_alias_path_wildcard_nested(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['groups', ..., ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'list', 'items_schema': {'type': 'str'}}},
+                }
+            },
+        }
+    )
+    input_value = {'groups': [[{'name': 'A'}, {'name': 'B'}], [{'name': 'C'}]]}
+    assert v.validate_test(input_value) == ({'field_a': [['A', 'B'], ['C']]}, None, {'field_a'})
+
+
+@pytest.mark.olympus
+def test_alias_choices_wildcard(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['writers'], ['authors', ..., 'name']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'writers': ['X', 'Y'], 'authors': [{'name': 'A'}]}) == (
+        {'field_a': ['X', 'Y']},
+        None,
+        {'field_a'},
+    )
+    assert v.validate_test({'authors': [{'name': 'A'}]}) == ({'field_a': ['A']}, None, {'field_a'})
+
+
+@pytest.mark.olympus
+def test_alias_path_wildcard_error_loc(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        },
+        {'loc_by_alias': True},
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}) == (
+        {'field_a': ['Alice', 'Bob']},
+        None,
+        {'field_a'},
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_test({'authors': [{'name': 'Alice'}, {}]})
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'string_type',
+            'loc': ('authors', '*', 'name', 1),
+            'msg': 'Input should be a valid string',
+            'input': None,
+        }
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_test({'authors': 'not-a-list'})
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'missing',
+            'loc': ('authors', '*', 'name'),
+            'msg': 'Field required',
+            'input': {'authors': 'not-a-list'},
+        }
+    ]
+
+
+@pytest.mark.olympus
+def test_alias_wildcard_extra_forbid(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}) == (
+        {'field_a': ['Alice', 'Bob']},
+        None,
+        {'field_a'},
+    )
+
+
+@pytest.mark.olympus
+def test_alias_wildcard_extra_allow(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'allow',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}]}) == ({'field_a': ['Alice']}, {}, {'field_a'})
+
+
+@pytest.mark.olympus
+def test_alias_choices_wildcard_extra_forbid(py_and_json: PyAndJson):
+    # regression test: once a field has *any* wildcard alias, none of its lookup paths (including
+    # non-wildcard alias choices and its plain name) are tracked by the fast-path `LookupTree`, so all
+    # of their root keys need to be excluded from "extra" detection, not just the wildcard one.
+    #
+    # NB each case below provides only *one* of the two alias choices: providing both at once hits an
+    # unrelated, pre-existing inconsistency between the python-input and JSON-input paths for
+    # `AliasChoices` in general (not specific to wildcards) where the non-winning choice's key can be
+    # flagged as extra on the python-input path but not the JSON-input path - out of scope here.
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['writers'], ['authors', ..., 'name']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'writers': ['X', 'Y']}) == ({'field_a': ['X', 'Y']}, None, {'field_a'})
+    assert v.validate_test({'authors': [{'name': 'A'}]}) == ({'field_a': ['A']}, None, {'field_a'})
+
+
+@pytest.mark.olympus
+def test_alias_wildcard_extra_forbid_by_name(py_and_json: PyAndJson):
+    # regression test: the plain field name is also excluded from the `LookupTree` once the field has a
+    # wildcard alias, so it must be excluded from "extra" detection too
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        },
+        config=CoreConfig(validate_by_name=True),
+    )
+    assert v.validate_test({'field_a': ['Alice']}) == ({'field_a': ['Alice']}, None, {'field_a'})
+
+
+@pytest.mark.olympus
+def test_alias_wildcard_validate_by_name_only(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        },
+        config=CoreConfig(validate_by_alias=False, validate_by_name=True),
+    )
+    assert v.validate_test({'field_a': ['Alice', 'Bob']}) == ({'field_a': ['Alice', 'Bob']}, None, {'field_a'})
+    with pytest.raises(ValidationError, match=r'field_a\n +Field required \[type=missing,'):
+        v.validate_test({'authors': [{'name': 'Alice'}]})
+
+
 def test_alias_error_loc_field_names(py_and_json: PyAndJson):
     v = py_and_json(
         {

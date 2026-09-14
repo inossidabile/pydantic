@@ -1,11 +1,13 @@
+import json
 from contextlib import AbstractContextManager
 from contextlib import nullcontext as does_not_raise
 from inspect import signature
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
 from dirty_equals import IsStr
 from pydantic_core import PydanticUndefined
+from typing_extensions import TypedDict
 
 from pydantic import (
     AliasChoices,
@@ -15,6 +17,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PydanticUserError,
+    TypeAdapter,
     ValidationError,
     computed_field,
 )
@@ -609,6 +612,158 @@ def test_search_dict_for_alias_path():
     ap = AliasPath('a', 1)
     assert ap.search_dict_for_path({'a': ['hello', 'world']}) == 'world'
     assert ap.search_dict_for_path({'a': 'hello'}) is PydanticUndefined
+
+
+@pytest.mark.olympus
+class TestAliasPathWildcard:
+    @pytest.fixture
+    def model(self):
+        class Blog(BaseModel):
+            name: str
+            authors: list[str] = Field(validation_alias=AliasPath('authors', ..., 'name'))
+
+        return Blog
+
+    @pytest.fixture
+    def data(self):
+        return {'name': 'Blog entry', 'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}
+
+    def test_validate_python(self, model, data):
+        result = model.model_validate(data)
+        assert (result.name, result.authors) == ('Blog entry', ['Alice', 'Bob'])
+
+    def test_validate_json(self, model, data):
+        result = model.model_validate_json(json.dumps(data))
+        assert (result.name, result.authors) == ('Blog entry', ['Alice', 'Bob'])
+
+    def test_model_construct(self, model, data):
+        result = model.model_construct(**data)
+        assert (result.name, result.authors) == ('Blog entry', ['Alice', 'Bob'])
+
+    def test_empty_list(self, model):
+        data = {'name': 'x', 'authors': []}
+        assert model.model_validate(data).authors == []
+        assert model.model_validate_json(json.dumps(data)).authors == []
+
+    def test_extra_forbid_does_not_flag_wildcard_root_key_as_extra(self, model, data):
+        class Blog(model):
+            model_config = ConfigDict(extra='forbid')
+
+        assert Blog.model_validate(data).authors == ['Alice', 'Bob']
+        assert Blog.model_validate_json(json.dumps(data)).authors == ['Alice', 'Bob']
+
+    @pytest.mark.parametrize('validate', ['python', 'json'])
+    def test_missing_key_in_one_element_becomes_none(self, model, validate):
+        data = {'name': 'x', 'authors': [{'name': 'Alice'}, {}]}
+        with pytest.raises(ValidationError) as exc_info:
+            if validate == 'python':
+                model.model_validate(data)
+            else:
+                model.model_validate_json(json.dumps(data))
+        assert exc_info.value.errors()[0]['type'] == 'string_type'
+        assert exc_info.value.errors()[0]['input'] is None
+
+    @pytest.mark.parametrize('validate', ['python', 'json'])
+    def test_error_loc_includes_wildcard_marker(self, model, validate):
+        data = {'name': 'x', 'authors': [{'name': 'Alice'}, {}]}
+        with pytest.raises(ValidationError) as exc_info:
+            if validate == 'python':
+                model.model_validate(data)
+            else:
+                model.model_validate_json(json.dumps(data))
+        assert exc_info.value.errors()[0]['loc'] == ('authors', '*', 'name', 1)
+
+    @pytest.mark.parametrize('validate', ['python', 'json'])
+    def test_error_loc_includes_wildcard_marker_when_required_and_not_found(self, model, validate):
+        data = {'name': 'x', 'authors': 'not-a-list'}
+        with pytest.raises(ValidationError) as exc_info:
+            if validate == 'python':
+                model.model_validate(data)
+            else:
+                model.model_validate_json(json.dumps(data))
+        assert exc_info.value.errors()[0]['loc'] == ('authors', '*', 'name')
+
+    @pytest.mark.parametrize('validate', ['python', 'json'])
+    def test_non_list_value_at_wildcard_is_treated_as_not_found(self, validate):
+        class Model(BaseModel):
+            authors: list[str] | None = Field(None, validation_alias=AliasPath('authors', ..., 'name'))
+
+        data = {'authors': 'not-a-list'}
+        if validate == 'python':
+            assert Model.model_validate(data).authors is None
+        else:
+            assert Model.model_validate_json(json.dumps(data)).authors is None
+
+    def test_tuple_value_at_wildcard(self, model):
+        # a wildcard should map over any sequence, not just lists
+        data = {'name': 'x', 'authors': ({'name': 'Alice'},)}
+        assert model.model_validate(data).authors == ['Alice']
+
+    def test_bare_wildcard_passes_through_the_list(self):
+        class Model(BaseModel):
+            authors: list[dict] = Field(validation_alias=AliasPath('authors', ...))
+
+        data = {'authors': [{'name': 'Alice'}]}
+        assert Model.model_validate(data).authors == [{'name': 'Alice'}]
+        assert Model.model_validate_json(json.dumps(data)).authors == [{'name': 'Alice'}]
+
+    def test_nested_wildcards(self):
+        class Model(BaseModel):
+            names: list[list[str]] = Field(validation_alias=AliasPath('groups', ..., ..., 'name'))
+
+        data = {'groups': [[{'name': 'A'}, {'name': 'B'}], [{'name': 'C'}]]}
+        assert Model.model_validate(data).names == [['A', 'B'], ['C']]
+        assert Model.model_validate_json(json.dumps(data)).names == [['A', 'B'], ['C']]
+
+    @pytest.mark.parametrize('validate', ['python', 'json'])
+    def test_wildcard_as_alias_choice(self, validate):
+        class Model(BaseModel):
+            authors: list[str] = Field(validation_alias=AliasChoices('writers', AliasPath('authors', ..., 'name')))
+
+        by_plain_key = {'writers': ['X', 'Y']}
+        by_wildcard = {'authors': [{'name': 'A'}]}
+        if validate == 'python':
+            assert Model.model_validate(by_plain_key).authors == ['X', 'Y']
+            assert Model.model_validate(by_wildcard).authors == ['A']
+        else:
+            assert Model.model_validate_json(json.dumps(by_plain_key)).authors == ['X', 'Y']
+            assert Model.model_validate_json(json.dumps(by_wildcard)).authors == ['A']
+
+    @pytest.mark.parametrize('validate', ['python', 'json'])
+    def test_wildcard_as_alias_choice_precedence(self, validate):
+        # when both aliases match, the first one listed wins
+        class Model(BaseModel):
+            authors: list[str] = Field(validation_alias=AliasChoices('writers', AliasPath('authors', ..., 'name')))
+
+        data = {'writers': ['X', 'Y'], 'authors': [{'name': 'A'}]}
+        if validate == 'python':
+            assert Model.model_validate(data).authors == ['X', 'Y']
+        else:
+            assert Model.model_validate_json(json.dumps(data)).authors == ['X', 'Y']
+
+    def test_from_attributes(self):
+        class Author:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class Source:
+            def __init__(self, authors: list[Author]) -> None:
+                self.authors = authors
+
+        class Model(BaseModel):
+            model_config = ConfigDict(from_attributes=True)
+            authors: list[str] = Field(validation_alias=AliasPath('authors', ..., 'name'))
+
+        assert Model.model_validate(Source([Author('A'), Author('B')])).authors == ['A', 'B']
+
+    def test_typed_dict(self):
+        class BlogDict(TypedDict):
+            authors: Annotated[list[str], Field(validation_alias=AliasPath('authors', ..., 'name'))]
+
+        ta = TypeAdapter(BlogDict)
+        data = {'authors': [{'name': 'A'}, {'name': 'B'}]}
+        assert ta.validate_python(data) == {'authors': ['A', 'B']}
+        assert ta.validate_json(json.dumps(data)) == {'authors': ['A', 'B']}
 
 
 def test_validation_alias_invalid_value_type():

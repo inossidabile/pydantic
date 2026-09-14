@@ -4,11 +4,36 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
+from types import EllipsisType
 from typing import Any, Literal
 
 from pydantic_core import PydanticUndefined
 
 __all__ = ('AliasGenerator', 'AliasPath', 'AliasChoices')
+
+
+def _search_path(value: Any, path: list[int | str | EllipsisType]) -> Any:
+    for i, k in enumerate(path):
+        if k is Ellipsis:
+            # unpack the rest of the path from every element of a list/tuple, e.g. for
+            # AliasPath('authors', ..., 'name') and authors=[{'name': 'Alice'}, {'name': 'Bob'}],
+            # this returns ['Alice', 'Bob']
+            if not isinstance(value, (list, tuple)):
+                return PydanticUndefined
+            remaining = path[i + 1 :]
+            result = []
+            for item in value:
+                mapped = _search_path(item, remaining) if remaining else item
+                result.append(None if mapped is PydanticUndefined else mapped)
+            return result
+        if isinstance(value, str):
+            # disallow indexing into a str, like for AliasPath('x', 0) and x='abc'
+            return PydanticUndefined
+        try:
+            value = value[k]
+        except (KeyError, IndexError, TypeError):
+            return PydanticUndefined
+    return value
 
 
 @dataclasses.dataclass(slots=True)
@@ -19,15 +44,16 @@ class AliasPath:
     A data class used by `validation_alias` as a convenience to create aliases.
 
     Attributes:
-        path: A list of string or integer aliases.
+        path: A list of string or integer aliases, or `...` (`Ellipsis`) to unpack the rest of the
+            path from every element of a list, e.g. `AliasPath('authors', ..., 'name')`.
     """
 
-    path: list[int | str]
+    path: list[int | str | EllipsisType]
 
-    def __init__(self, first_arg: str, *args: str | int) -> None:
+    def __init__(self, first_arg: str, *args: str | int | EllipsisType) -> None:
         self.path = [first_arg] + list(args)
 
-    def convert_to_aliases(self) -> list[str | int]:
+    def convert_to_aliases(self) -> list[str | int | EllipsisType]:
         """Converts arguments to a list of string or integer aliases.
 
         Returns:
@@ -41,16 +67,7 @@ class AliasPath:
         Returns:
             The value at the specified path, or `PydanticUndefined` if the path is not found.
         """
-        v = d
-        for k in self.path:
-            if isinstance(v, str):
-                # disallow indexing into a str, like for AliasPath('x', 0) and x='abc'
-                return PydanticUndefined
-            try:
-                v = v[k]
-            except (KeyError, IndexError, TypeError):
-                return PydanticUndefined
-        return v
+        return _search_path(d, self.path)
 
 
 @dataclasses.dataclass(slots=True)
@@ -69,13 +86,13 @@ class AliasChoices:
     def __init__(self, first_choice: str | AliasPath, *choices: str | AliasPath) -> None:
         self.choices = [first_choice] + list(choices)
 
-    def convert_to_aliases(self) -> list[list[str | int]]:
+    def convert_to_aliases(self) -> list[list[str | int | EllipsisType]]:
         """Converts arguments to a list of lists containing string or integer aliases.
 
         Returns:
             The list of aliases.
         """
-        aliases: list[list[str | int]] = []
+        aliases: list[list[str | int | EllipsisType]] = []
         for c in self.choices:
             if isinstance(c, AliasPath):
                 aliases.append(c.convert_to_aliases())

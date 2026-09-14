@@ -21,6 +21,7 @@ use crate::lookup_key::LookupType;
 use crate::tools::SchemaDict;
 use crate::tools::new_py_string;
 use crate::validators::shared::lookup_tree::LookupFieldInfo;
+use crate::validators::shared::lookup_tree::LookupFieldPriority;
 use crate::validators::shared::lookup_tree::LookupTree;
 
 use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator, build_validator};
@@ -46,6 +47,12 @@ pub struct ModelFieldsValidator {
     from_attributes: bool,
     loc_by_alias: bool,
     lookup: LookupTree,
+    /// Indices (into `fields`) of fields which have a wildcard (`...`) alias path, and so are handled
+    /// via a dedicated fallback lookup pass rather than through `lookup`.
+    wildcard_fields: Vec<usize>,
+    /// Top-level JSON keys consumed by `wildcard_fields`'s alias paths, so they aren't mistakenly
+    /// treated as extra/unknown keys during the single-pass JSON iteration.
+    wildcard_root_keys: AHashSet<String>,
     validate_by_alias: Option<bool>,
     validate_by_name: Option<bool>,
 }
@@ -107,6 +114,27 @@ impl BuildValidator for ModelFieldsValidator {
 
         let lookup = LookupTree::from_fields(&fields, |field| &field.lookup_path_collection);
 
+        // Fields with a wildcard (`...`) alias path can't be handled by the single-pass `LookupTree`
+        // above (they synthesize new data rather than pointing at an existing node), so they get a
+        // dedicated fallback lookup pass instead, see `validate_json_by_iteration`.
+        //
+        // Once any of a field's alias paths has a wildcard, *none* of that field's paths (its plain
+        // name, and any other non-wildcard alias choices) are added to the tree either - so every one
+        // of them needs its root key registered here too, or the single-pass loop below would
+        // mistakenly treat a legitimately-consumed key as an unknown extra field.
+        let mut wildcard_fields = Vec::new();
+        let mut wildcard_root_keys: AHashSet<String> = AHashSet::new();
+        for (field_index, field) in fields.iter().enumerate() {
+            let collection = &field.lookup_path_collection;
+            if collection.has_wildcard() {
+                wildcard_fields.push(field_index);
+                wildcard_root_keys.insert(collection.by_name.first_key().to_string());
+                for path in &collection.by_alias {
+                    wildcard_root_keys.insert(path.first_key().to_string());
+                }
+            }
+        }
+
         Ok(CombinedValidator::ModelFields(Self {
             fields,
             model_name,
@@ -117,6 +145,8 @@ impl BuildValidator for ModelFieldsValidator {
             from_attributes,
             loc_by_alias: config.get_as(intern!(py, "loc_by_alias"))?.unwrap_or(true),
             lookup,
+            wildcard_fields,
+            wildcard_root_keys,
             validate_by_alias: config.get_as(intern!(py, "validate_by_alias"))?,
             validate_by_name: config.get_as(intern!(py, "validate_by_name"))?,
         })
@@ -538,11 +568,11 @@ impl ModelFieldsValidator {
         }
     }
 
-    fn validate_json_by_iteration<'py>(
+    fn validate_json_by_iteration<'py, 'data>(
         &self,
         py: Python<'py>,
-        json_input: &JsonValue<'_>,
-        json_object: &JsonObject<'_>,
+        json_input: &JsonValue<'data>,
+        json_object: &JsonObject<'data>,
         state: &mut ValidationState<'_, 'py>,
     ) -> ValResult<ValidatedModelFields<'py>> {
         // expect json_input and json_object to be the same thing, just projected
@@ -555,7 +585,7 @@ impl ModelFieldsValidator {
 
         let model_dict = PyDict::new(py);
         let mut model_extra_dict_op: Option<Bound<PyDict>> = None;
-        let mut field_results: Vec<Option<(LookupFieldInfo, &JsonValue)>> =
+        let mut field_results: Vec<Option<(LookupFieldInfo, JsonValue<'data>)>> =
             (0..self.fields.len()).map(|_| None).collect();
         let mut errors: Vec<ValLineError> = Vec::new();
         let fields_set = PySet::empty(py)?;
@@ -586,10 +616,10 @@ impl ModelFieldsValidator {
                     continue;
                 }
 
-                *field_result = Some((*field_info, field_value));
+                *field_result = Some((*field_info, field_value.clone()));
             }
 
-            if handled {
+            if handled || self.wildcard_root_keys.contains(key) {
                 continue;
             }
 
@@ -626,6 +656,35 @@ impl ModelFieldsValidator {
             }
         }
 
+        // Fields with a wildcard alias path aren't in `self.lookup`, so weren't found above;
+        // look them up directly now, trying paths in priority order (aliases before the field name).
+        for &field_index in &self.wildcard_fields {
+            let collection = &self.fields[field_index].lookup_path_collection;
+
+            let mut found = None;
+            if lookup_type.matches(LookupType::Alias) {
+                for (alias_index, path) in collection.by_alias.iter().enumerate() {
+                    if let Some(value) = path.json_get(json_object)? {
+                        found = Some((
+                            LookupFieldInfo::new(field_index, LookupFieldPriority::new(LookupType::Alias, alias_index)),
+                            value,
+                        ));
+                        break;
+                    }
+                }
+            }
+            if found.is_none() && (collection.by_alias.is_empty() || lookup_type.matches(LookupType::Name)) {
+                found = collection.by_name.json_get(json_object)?.map(|value| {
+                    (
+                        LookupFieldInfo::new(field_index, LookupFieldPriority::new(LookupType::Name, 0)),
+                        value,
+                    )
+                });
+            }
+
+            field_results[field_index] = found;
+        }
+
         // now that we've iterated over all the keys, we can set the values in the model
         // dict, and try to set defaults for any missing fields
 
@@ -633,7 +692,7 @@ impl ModelFieldsValidator {
             let state = &mut state.scoped_set_field_name(Some(field.name.as_py_str().bind(py).clone()));
 
             let field_value = if let Some((field_info, field_json_value)) = field_result {
-                match field.validator.validate(py, field_json_value, state) {
+                match field.validator.validate(py, &field_json_value, state) {
                     Ok(value) => {
                         fields_set.add(&field.name)?;
                         fields_set_count += 1;

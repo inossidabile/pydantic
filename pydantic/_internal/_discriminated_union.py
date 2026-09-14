@@ -1,5 +1,6 @@
 from __future__ import annotations as _annotations
 
+from types import EllipsisType
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic_core import CoreSchema, core_schema
@@ -225,13 +226,16 @@ class _ApplyInferredDiscriminator:
 
         if self._discriminator_alias is not None and self._discriminator_alias != self.discriminator:
             # * We need to annotate `discriminator` as a union here to handle both branches of this conditional
-            # * We need to annotate `discriminator` as list[list[str | int]] and not list[list[str]] due to the
-            #   invariance of list, and because list[list[str | int]] is the type of the discriminator argument
-            #   to tagged_union_schema below
+            # * We need to annotate `discriminator` as list[list[str | int | EllipsisType]] and not list[list[str]]
+            #   due to the invariance of list, and because list[list[str | int | EllipsisType]] is the type of the
+            #   discriminator argument to tagged_union_schema below
             # * See the docstring of pydantic_core.core_schema.tagged_union_schema for more details about how to
             #   interpret the value of the discriminator argument to tagged_union_schema. (The list[list[str]] here
             #   is the appropriate way to provide a list of fallback attributes to check for a discriminator value.)
-            discriminator: str | list[list[str | int]] = [[self.discriminator], [self._discriminator_alias]]
+            discriminator: str | list[list[str | int | EllipsisType]] = [
+                [self.discriminator],
+                [self._discriminator_alias],
+            ]
         else:
             discriminator = self.discriminator
         return core_schema.tagged_union_schema(

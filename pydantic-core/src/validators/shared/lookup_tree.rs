@@ -26,6 +26,13 @@ impl LookupTree {
         for (field_index, field) in fields.iter().enumerate() {
             let collection = get_field_collection(field);
 
+            if collection.has_wildcard() {
+                // Fields with a wildcard (`...`) alias path require a dedicated lookup pass, since they
+                // synthesize new data (mapping over array elements) rather than pointing at a single
+                // existing node in the input. Callers are expected to handle these fields separately.
+                continue;
+            }
+
             add_path_to_map(
                 &mut tree.inner,
                 &collection.by_name,
@@ -81,6 +88,15 @@ pub struct LookupFieldPriority {
 }
 
 impl LookupFieldPriority {
+    /// Construct a priority for a lookup which isn't (yet) tracked in a `LookupTree`, e.g. because it was
+    /// resolved via a dedicated fallback pass for fields with a wildcard (`...`) alias path.
+    pub fn new(lookup_type: LookupType, alias_index: usize) -> Self {
+        Self {
+            lookup_type,
+            alias_index,
+        }
+    }
+
     /// Returns `true` if `self` has higher priority than `other`, i.e. data from this lookup should be used over data from `other`.
     pub fn is_higher_priority_than(&self, other: &Self) -> bool {
         if self.lookup_type == LookupType::Name {
@@ -106,6 +122,14 @@ pub struct LookupFieldInfo {
 }
 
 impl LookupFieldInfo {
+    /// Construct a `LookupFieldInfo` which isn't (yet) tracked in a `LookupTree`, see [`LookupFieldPriority::new`].
+    pub fn new(field_index: usize, lookup_priority: LookupFieldPriority) -> Self {
+        Self {
+            field_index,
+            lookup_priority,
+        }
+    }
+
     /// Whether this lookup should be used for the given lookup type (i.e. when validating by_name / by_alias)
     pub fn matches_lookup(&self, lookup_type: LookupType) -> bool {
         self.lookup_priority.lookup_type.matches(lookup_type)
@@ -164,6 +188,8 @@ fn add_path_to_map(map: &mut AHashMap<PathItemString, LookupTreeNode>, path: &Lo
             PathItem::S(s) => tree_node.map.entry(s.clone()).or_default(),
             PathItem::Pos(i) => tree_node.list.entry(*i as i64).or_default(),
             PathItem::Neg(i) => tree_node.list.entry(-(*i as i64)).or_default(),
+            // callers are expected to skip paths containing a wildcard, see `LookupTree::from_fields`
+            PathItem::Wildcard => return,
         };
 
         current = next;
@@ -180,6 +206,7 @@ fn add_path_to_map(map: &mut AHashMap<PathItemString, LookupTreeNode>, path: &Lo
         PathItem::Neg(i) => {
             add_field_to_map(&mut tree_node.list, -(*i as i64), info);
         }
+        PathItem::Wildcard => {}
     }
 }
 
