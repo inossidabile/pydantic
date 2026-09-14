@@ -1,4 +1,4 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::convert::Infallible;
 use std::fmt;
 
@@ -6,9 +6,9 @@ use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyAttributeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedStr;
-use pyo3::types::{PyDict, PyList, PyMapping, PyString};
+use pyo3::types::{PyDict, PyEllipsis, PyList, PyMapping, PyString, PyTuple};
 
-use jiter::{JsonObject, JsonValue};
+use jiter::{JsonArray, JsonObject, JsonValue};
 use smallvec::SmallVec;
 
 use crate::build_tools::py_schema_err;
@@ -80,7 +80,11 @@ impl LookupPath {
 
         let first_item = PathItemString(first_item_py_str.try_into()?);
 
-        let rest = iter.map(PathItem::from_py).collect::<PyResult<_>>()?;
+        let rest = iter.map(PathItem::from_py).collect::<PyResult<Vec<_>>>()?;
+
+        if rest.iter().filter(|item| matches!(item, PathItem::Wildcard)).count() > 1 {
+            return py_schema_err!("Alias paths can only contain a single '...' wildcard item");
+        }
 
         Ok(Self { first_item, rest })
     }
@@ -137,39 +141,96 @@ impl LookupPath {
         }
     }
 
-    pub fn json_get<'a, 'data>(&self, dict: &'a JsonObject<'data>) -> ValResult<Option<&'a JsonValue<'data>>> {
+    pub fn json_get<'a, 'data>(&self, dict: &'a JsonObject<'data>) -> ValResult<Option<Cow<'a, JsonValue<'data>>>> {
         // FIXME: use of find_map in here probably leads to quadratic complexity
 
         // first step is different as the first step is a key lookup
-        if let Some(v) = dict
+        let Some(first_value) = dict
             .iter()
             .rev()
             .find_map(|(k, v)| (k == self.first_key()).then_some(v))
-        // fold the rest of the path over the found value
-            && let Some(v) = self.rest.iter().try_fold(v, |d, loc| loc.json_get(d))
-        {
-            return Ok(Some(v));
-        }
-
-        Ok(None)
-    }
-
-    fn get_impl<'s, 'a, SourceT, OutputT: 'a>(
-        &'s self,
-        source: &'a SourceT,
-        lookup: impl Fn(&'a SourceT, &'s PathItemString) -> PyResult<Option<OutputT>>,
-        nested_lookup: impl Fn(OutputT, &'s PathItem) -> PyResult<Option<OutputT>>,
-    ) -> PyResult<Option<OutputT>> {
-        let Some(mut value) = lookup(source, &self.first_item)? else {
+        else {
             return Ok(None);
         };
 
-        // iterate over the path and plug each value into the value from the last step
-        for loc in &self.rest {
+        Ok(Self::json_resolve_rest(first_value, &self.rest))
+    }
+
+    /// Walk `rest` on top of `value`. Ordinarily this just folds `PathItem::json_get` over the
+    /// remaining items and stays zero-copy (`Cow::Borrowed`). A `PathItem::Wildcard` switches the
+    /// resolution to map the remaining items over every element of the array found so far,
+    /// which requires building a new, owned `JsonValue::Array` (`Cow::Owned`) since that value
+    /// doesn't exist verbatim anywhere in the original document.
+    fn json_resolve_rest<'a, 'data>(
+        value: &'a JsonValue<'data>,
+        rest: &[PathItem],
+    ) -> Option<Cow<'a, JsonValue<'data>>> {
+        let mut value = value;
+        for (i, loc) in rest.iter().enumerate() {
+            if let PathItem::Wildcard = loc {
+                let JsonValue::Array(array) = value else {
+                    return None;
+                };
+                let mut collected = Vec::with_capacity(array.len());
+                for element in array.iter() {
+                    if let Some(resolved) = Self::json_resolve_rest(element, &rest[i + 1..]) {
+                        collected.push(resolved.into_owned());
+                    }
+                }
+                return Some(Cow::Owned(JsonValue::Array(JsonArray::new(collected))));
+            }
+            value = loc.json_get(value)?;
+        }
+        Some(Cow::Borrowed(value))
+    }
+
+    fn get_impl<'s, 'a, 'py, SourceT>(
+        &'s self,
+        source: &'a SourceT,
+        lookup: impl Fn(&'a SourceT, &'s PathItemString) -> PyResult<Option<Bound<'py, PyAny>>>,
+        nested_lookup: impl Fn(Bound<'py, PyAny>, &'s PathItem) -> PyResult<Option<Bound<'py, PyAny>>>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let Some(value) = lookup(source, &self.first_item)? else {
+            return Ok(None);
+        };
+
+        Self::resolve_rest(value, &self.rest, &nested_lookup)
+    }
+
+    /// Python-side counterpart to `json_resolve_rest`: same fold-with-a-wildcard-branch shape,
+    /// except a `PathItem::Wildcard` maps the remaining path over a `list`/`tuple` and collects
+    /// the results into a brand new `PyList`. Elements for which the remaining path doesn't
+    /// resolve (missing key/attr) are omitted from that list rather than erroring, so the
+    /// synthesized list only contains the items that actually had a value.
+    fn resolve_rest<'s, 'py>(
+        mut value: Bound<'py, PyAny>,
+        rest: &'s [PathItem],
+        nested_lookup: &impl Fn(Bound<'py, PyAny>, &'s PathItem) -> PyResult<Option<Bound<'py, PyAny>>>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        for (i, loc) in rest.iter().enumerate() {
+            if matches!(loc, PathItem::Wildcard) {
+                let py = value.py();
+                let items: Vec<Bound<'py, PyAny>> = if let Ok(list) = value.cast::<PyList>() {
+                    list.iter().collect()
+                } else if let Ok(tuple) = value.cast::<PyTuple>() {
+                    tuple.iter().collect()
+                } else {
+                    return Ok(None);
+                };
+
+                let mut collected = Vec::with_capacity(items.len());
+                for item in items {
+                    if let Some(resolved) = Self::resolve_rest(item, &rest[i + 1..], nested_lookup)? {
+                        collected.push(resolved);
+                    }
+                }
+                return Ok(Some(PyList::new(py, collected)?.into_any()));
+            }
+
             value = match nested_lookup(value, loc)? {
                 Some(v) => v,
                 None => return Ok(None),
-            }
+            };
         }
 
         // Successfully found an item, return it
@@ -219,6 +280,9 @@ pub(crate) enum PathItem {
     /// integer key, used to get items from a list, tuple OR a dict with int keys `dict[int, ...]` (python only)
     Pos(usize),
     Neg(usize),
+    /// `...`, maps the rest of the path over every element of the array found so far and
+    /// collects the results into a new list
+    Wildcard,
 }
 
 /// String type key, used to get or identify items from a dict or anything that implements `__getitem__`
@@ -254,6 +318,7 @@ impl fmt::Display for PathItem {
             Self::S(key) => key.fmt(f),
             Self::Pos(key) => write!(f, "{key}"),
             Self::Neg(key) => write!(f, "-{key}"),
+            Self::Wildcard => write!(f, "..."),
         }
     }
 }
@@ -271,6 +336,7 @@ impl<'py> IntoPyObject<'py> for &'_ PathItem {
                 let neg_value = -(*val as i64);
                 neg_value.into_bound_py_any(py)
             }
+            PathItem::Wildcard => Ok(PyEllipsis::get(py).to_owned().into_any()),
         }
     }
 }
@@ -287,6 +353,10 @@ impl<'py> IntoPyObject<'py> for &'_ PathItemString {
 
 impl PathItem {
     pub fn from_py(obj: Bound<'_, PyAny>) -> PyResult<Self> {
+        if obj.is_instance_of::<PyEllipsis>() {
+            return Ok(Self::Wildcard);
+        }
+
         let obj = match obj.cast_into::<PyString>() {
             Ok(py_str_key) => {
                 return Ok(Self::S(PathItemString(py_str_key.try_into()?)));
@@ -334,7 +404,7 @@ impl PathItem {
                         None
                     }
                 }
-                Self::S(..) => None,
+                Self::S(..) | Self::Wildcard => None,
             },
             _ => None,
         }
@@ -352,6 +422,7 @@ impl PathItem {
             Self::S(PathItemString(key)) => LocItem::from(key.clone()),
             Self::Pos(index) => LocItem::from(*index),
             Self::Neg(index) => LocItem::from(-(*index as i64)),
+            Self::Wildcard => LocItem::from("..."),
         }
     }
 }

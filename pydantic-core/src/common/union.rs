@@ -2,7 +2,8 @@ use pyo3::prelude::*;
 use pyo3::{PyTraverseError, PyVisit};
 use smallvec::SmallVec;
 
-use crate::lookup_key::{LookupPath, ValidationAlias};
+use crate::build_tools::py_schema_err;
+use crate::lookup_key::{LookupPath, PathItem, ValidationAlias};
 use crate::py_gc::PyGcTraverse;
 
 #[derive(Debug)]
@@ -20,7 +21,19 @@ impl Discriminator {
         }
 
         let lookup: ValidationAlias = raw.extract()?;
-        Ok(Self::LookupPaths(lookup.into_paths()))
+        let paths = lookup.into_paths();
+
+        // a discriminator must resolve to a single tag value to look up the matching union member,
+        // whereas a `...` wildcard resolves to a list, so it never makes sense here (unlike in a
+        // field's `validation_alias`, where the resulting list is exactly what's wanted)
+        if paths
+            .iter()
+            .any(|path| path.rest().iter().any(|item| matches!(item, PathItem::Wildcard)))
+        {
+            return py_schema_err!("Discriminator paths cannot contain a '...' wildcard item");
+        }
+
+        Ok(Self::LookupPaths(paths))
     }
 
     pub fn to_string_py(&self, py: Python) -> PyResult<String> {

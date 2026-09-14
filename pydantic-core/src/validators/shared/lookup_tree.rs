@@ -148,6 +148,14 @@ fn add_field_to_map<K: Hash + Eq>(map: &mut AHashMap<K, LookupTreeNode>, key: K,
 }
 
 fn add_path_to_map(map: &mut AHashMap<PathItemString, LookupTreeNode>, path: &LookupPath, info: LookupFieldInfo) {
+    // A `...` wildcard maps the rest of the path over every element of an array and collects the
+    // results into a brand new list, which this tree (a map of exact key/index paths to fields)
+    // can't express. Fields with a wildcard alias are simply left out of the tree; they're resolved
+    // by a direct `LookupPath::json_get` fallback instead (see `validate_json_by_iteration`).
+    if path.rest().iter().any(|item| matches!(item, PathItem::Wildcard)) {
+        return;
+    }
+
     let base_key = path.first_item().to_owned();
     let mut path_iter = path.rest().iter();
 
@@ -164,6 +172,7 @@ fn add_path_to_map(map: &mut AHashMap<PathItemString, LookupTreeNode>, path: &Lo
             PathItem::S(s) => tree_node.map.entry(s.clone()).or_default(),
             PathItem::Pos(i) => tree_node.list.entry(*i as i64).or_default(),
             PathItem::Neg(i) => tree_node.list.entry(-(*i as i64)).or_default(),
+            PathItem::Wildcard => unreachable!("wildcard paths are skipped above"),
         };
 
         current = next;
@@ -180,6 +189,7 @@ fn add_path_to_map(map: &mut AHashMap<PathItemString, LookupTreeNode>, path: &Lo
         PathItem::Neg(i) => {
             add_field_to_map(&mut tree_node.list, -(*i as i64), info);
         }
+        PathItem::Wildcard => unreachable!("wildcard paths are skipped above"),
     }
 }
 

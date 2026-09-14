@@ -1,3 +1,4 @@
+import json
 from contextlib import AbstractContextManager
 from contextlib import nullcontext as does_not_raise
 from inspect import signature
@@ -5,7 +6,7 @@ from typing import Any
 
 import pytest
 from dirty_equals import IsStr
-from pydantic_core import PydanticUndefined
+from pydantic_core import PydanticUndefined, SchemaError
 
 from pydantic import (
     AliasChoices,
@@ -609,6 +610,78 @@ def test_search_dict_for_alias_path():
     ap = AliasPath('a', 1)
     assert ap.search_dict_for_path({'a': ['hello', 'world']}) == 'world'
     assert ap.search_dict_for_path({'a': 'hello'}) is PydanticUndefined
+
+
+def test_search_dict_for_alias_path_wildcard():
+    ap = AliasPath('authors', ..., 'name')
+    data = {'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}
+    assert ap.search_dict_for_path(data) == ['Alice', 'Bob']
+    # elements missing the rest of the path are dropped, not errored
+    assert ap.search_dict_for_path({'authors': [{'name': 'Alice'}, {'nope': 1}]}) == ['Alice']
+    # not a list/tuple at the wildcard position
+    assert ap.search_dict_for_path({'authors': 'oops'}) is PydanticUndefined
+
+
+def test_validation_alias_path_wildcard():
+    class Blog(BaseModel):
+        name: str
+        authors: list[str] = Field(validation_alias=AliasPath('authors', ..., 'name'))
+
+    data = {'name': 'Blog entry', 'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}
+    assert Blog.model_validate(data).authors == ['Alice', 'Bob']
+    assert Blog.model_validate_json(json.dumps(data)).authors == ['Alice', 'Bob']
+
+
+def test_validation_alias_path_wildcard_skips_missing():
+    class Blog(BaseModel):
+        authors: list[str] = Field(validation_alias=AliasPath('authors', ..., 'name'))
+
+    data = {'authors': [{'name': 'Alice'}, {'no_name': 1}, {'name': 'Bob'}]}
+    assert Blog.model_validate(data).authors == ['Alice', 'Bob']
+    assert Blog.model_validate_json(json.dumps(data)).authors == ['Alice', 'Bob']
+
+
+def test_validation_alias_path_wildcard_not_a_list():
+    class Blog(BaseModel):
+        authors: list[str] = Field(validation_alias=AliasPath('authors', ..., 'name'))
+
+    for data in ({'authors': 'oops'}, {}):
+        with pytest.raises(ValidationError) as exc_info:
+            Blog.model_validate(data)
+        assert exc_info.value.errors(include_url=False)[0]['type'] == 'missing'
+
+        with pytest.raises(ValidationError) as exc_info:
+            Blog.model_validate_json(json.dumps(data))
+        assert exc_info.value.errors(include_url=False)[0]['type'] == 'missing'
+
+
+def test_validation_alias_path_wildcard_trailing():
+    # a wildcard with nothing after it is just the list itself
+    class Blog(BaseModel):
+        tags: list[dict] = Field(validation_alias=AliasPath('meta', 'tags', ...))
+
+    data = {'meta': {'tags': [{'a': 1}, {'a': 2}]}}
+    assert Blog.model_validate(data).tags == [{'a': 1}, {'a': 2}]
+    assert Blog.model_validate_json(json.dumps(data)).tags == [{'a': 1}, {'a': 2}]
+
+
+def test_validation_alias_path_wildcard_extra_forbid():
+    # the wildcard's root key ('authors') must not be treated as an unknown/extra field
+    class Blog(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        name: str
+        authors: list[str] = Field(validation_alias=AliasPath('authors', ..., 'name'))
+
+    data = {'name': 'Blog entry', 'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}
+    assert Blog.model_validate(data).authors == ['Alice', 'Bob']
+    assert Blog.model_validate_json(json.dumps(data)).authors == ['Alice', 'Bob']
+
+
+def test_validation_alias_path_multiple_wildcards_invalid():
+    with pytest.raises(SchemaError, match="Alias paths can only contain a single '...' wildcard item"):
+
+        class Model(BaseModel):
+            x: list = Field(validation_alias=AliasPath('a', ..., 'b', ..., 'c'))
 
 
 def test_validation_alias_invalid_value_type():

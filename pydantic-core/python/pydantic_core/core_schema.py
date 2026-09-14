@@ -12,6 +12,7 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from re import Pattern
+from types import EllipsisType
 from typing import TYPE_CHECKING, Any, Literal, Union, overload
 
 from typing_extensions import TypeVar, deprecated
@@ -41,6 +42,11 @@ else:
 
 
 ExtraBehavior: TypeAlias = Literal['allow', 'forbid', 'ignore']
+
+# `AliasPath`/`AliasChoices` are converted to this shape before being passed to pydantic-core;
+# a bare item can be a `...` (`Ellipsis`) wildcard, which maps the rest of the path over every
+# element of the list found at that point and collects the results into a new list.
+AliasType: TypeAlias = str | list[str | int | EllipsisType] | list[list[str | int | EllipsisType]]
 
 
 class CoreConfig(TypedDict, total=False):
@@ -3329,7 +3335,7 @@ class TypedDictField(TypedDict, total=False):
     type: Required[Literal['typed-dict-field']]
     schema: Required[CoreSchema]
     required: bool
-    validation_alias: str | list[str | int] | list[list[str | int]]
+    validation_alias: AliasType
     serialization_alias: str
     serialization_exclude: bool  # default: False
     metadata: dict[str, Any]
@@ -3340,7 +3346,7 @@ def typed_dict_field(
     schema: CoreSchema,
     *,
     required: bool | None = None,
-    validation_alias: str | list[str | int] | list[list[str | int]] | None = None,
+    validation_alias: AliasType | None = None,
     serialization_alias: str | None = None,
     serialization_exclude: bool | None = None,
     metadata: dict[str, Any] | None = None,
@@ -3460,7 +3466,7 @@ def typed_dict_schema(
 class ModelField(TypedDict, total=False):
     type: Required[Literal['model-field']]
     schema: Required[CoreSchema]
-    validation_alias: str | list[str | int] | list[list[str | int]]
+    validation_alias: AliasType
     serialization_alias: str
     serialization_exclude: bool  # default: False
     serialization_exclude_if: Callable[[Any], bool]  # default: None
@@ -3471,7 +3477,7 @@ class ModelField(TypedDict, total=False):
 def model_field(
     schema: CoreSchema,
     *,
-    validation_alias: str | list[str | int] | list[list[str | int]] | None = None,
+    validation_alias: AliasType | None = None,
     serialization_alias: str | None = None,
     serialization_exclude: bool | None = None,
     serialization_exclude_if: Callable[[Any], bool] | None = None,
@@ -3691,7 +3697,7 @@ class DataclassField(TypedDict, total=False):
     init: bool  # default: True
     init_only: bool  # default: False
     frozen: bool  # default: False
-    validation_alias: str | list[str | int] | list[list[str | int]]
+    validation_alias: AliasType
     serialization_alias: str
     serialization_exclude: bool  # default: False
     metadata: dict[str, Any]
@@ -3705,7 +3711,7 @@ def dataclass_field(
     kw_only: bool | None = None,
     init: bool | None = None,
     init_only: bool | None = None,
-    validation_alias: str | list[str | int] | list[list[str | int]] | None = None,
+    validation_alias: AliasType | None = None,
     serialization_alias: str | None = None,
     serialization_exclude: bool | None = None,
     metadata: dict[str, Any] | None = None,
@@ -3899,7 +3905,7 @@ class NamedTupleField(TypedDict, total=False):
     type: Required[Literal['named-tuple-field']]
     name: Required[str]
     schema: Required[CoreSchema]
-    validation_alias: str | list[str | int] | list[list[str | int]]
+    validation_alias: AliasType
     metadata: dict[str, Any]
 
 
@@ -3907,7 +3913,7 @@ def named_tuple_field(
     name: str,
     schema: CoreSchema,
     *,
-    validation_alias: str | list[str | int] | list[list[str | int]] | None = None,
+    validation_alias: AliasType | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> NamedTupleField:
     """
@@ -4005,7 +4011,7 @@ class ArgumentsParameter(TypedDict, total=False):
     name: Required[str]
     schema: Required[CoreSchema]
     mode: Literal['positional_only', 'positional_or_keyword', 'keyword_only']  # default positional_or_keyword
-    alias: str | list[str | int] | list[list[str | int]]
+    alias: AliasType
 
 
 def arguments_parameter(
@@ -4013,7 +4019,7 @@ def arguments_parameter(
     schema: CoreSchema,
     *,
     mode: Literal['positional_only', 'positional_or_keyword', 'keyword_only'] | None = None,
-    alias: str | list[str | int] | list[list[str | int]] | None = None,
+    alias: AliasType | None = None,
 ) -> ArgumentsParameter:
     """
     Returns a schema that matches an argument parameter, e.g.:
@@ -4121,7 +4127,7 @@ class ArgumentsV3Parameter(TypedDict, total=False):
         'var_kwargs_uniform',
         'var_kwargs_unpacked_typed_dict',
     ]  # default positional_or_keyword
-    alias: str | list[str | int] | list[list[str | int]]
+    alias: AliasType
 
 
 def arguments_v3_parameter(
@@ -4137,7 +4143,7 @@ def arguments_v3_parameter(
         'var_kwargs_unpacked_typed_dict',
     ]
     | None = None,
-    alias: str | list[str | int] | list[list[str | int]] | None = None,
+    alias: AliasType | None = None,
 ) -> ArgumentsV3Parameter:
     """
     Returns a schema that matches an argument parameter, e.g.:

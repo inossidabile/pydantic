@@ -747,7 +747,7 @@ pub enum CombinedValidator {
     Nullable(nullable::NullableValidator),
     // create new model classes
     Model(model::ModelValidator),
-    ModelFields(model_fields::ModelFieldsValidator),
+    ModelFields(Box<model_fields::ModelFieldsValidator>),
     // dataclasses
     DataclassArgs(dataclass::DataclassArgsValidator),
     Dataclass(dataclass::DataclassValidator),

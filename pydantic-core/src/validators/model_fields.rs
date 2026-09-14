@@ -18,6 +18,8 @@ use crate::input::ConsumeIterator;
 use crate::input::{BorrowInput, Input, ValidatedDict, ValidationMatch};
 use crate::lookup_key::LookupPathCollection;
 use crate::lookup_key::LookupType;
+use crate::lookup_key::PathItem;
+use crate::lookup_key::PathItemString;
 use crate::tools::SchemaDict;
 use crate::tools::new_py_string;
 use crate::validators::shared::lookup_tree::LookupFieldInfo;
@@ -46,6 +48,13 @@ pub struct ModelFieldsValidator {
     from_attributes: bool,
     loc_by_alias: bool,
     lookup: LookupTree,
+    /// Root keys used by at least one wildcard (`...`) alias. The lookup tree can only express exact
+    /// key/index paths, so these keys are excluded from it entirely (see `LookupTree::from_fields`
+    /// / `add_path_to_map`); this list lets `validate_json_by_iteration` recognize them as "handled"
+    /// (rather than extra/unknown) without a tree entry, since their fields are resolved separately.
+    /// Wildcard aliases are rare, so this is a `Vec` (checked with a linear scan) rather than a
+    /// hash set, to avoid growing `CombinedValidator` for the (usual) case where it's empty.
+    wildcard_root_keys: Vec<PathItemString>,
     validate_by_alias: Option<bool>,
     validate_by_name: Option<bool>,
 }
@@ -107,7 +116,17 @@ impl BuildValidator for ModelFieldsValidator {
 
         let lookup = LookupTree::from_fields(&fields, |field| &field.lookup_path_collection);
 
-        Ok(CombinedValidator::ModelFields(Self {
+        let wildcard_root_keys: Vec<PathItemString> = fields
+            .iter()
+            .flat_map(|field| {
+                std::iter::once(&field.lookup_path_collection.by_name)
+                    .chain(field.lookup_path_collection.by_alias.iter())
+            })
+            .filter(|path| path.rest().iter().any(|item| matches!(item, PathItem::Wildcard)))
+            .map(|path| path.first_item().clone())
+            .collect();
+
+        Ok(CombinedValidator::ModelFields(Box::new(Self {
             fields,
             model_name,
             extra_behavior,
@@ -117,9 +136,10 @@ impl BuildValidator for ModelFieldsValidator {
             from_attributes,
             loc_by_alias: config.get_as(intern!(py, "loc_by_alias"))?.unwrap_or(true),
             lookup,
+            wildcard_root_keys,
             validate_by_alias: config.get_as(intern!(py, "validate_by_alias"))?,
             validate_by_name: config.get_as(intern!(py, "validate_by_name"))?,
-        })
+        }))
         .into())
     }
 }
@@ -589,7 +609,7 @@ impl ModelFieldsValidator {
                 *field_result = Some((*field_info, field_value));
             }
 
-            if handled {
+            if handled || self.wildcard_root_keys.iter().any(|k| &**k == key) {
                 continue;
             }
 
@@ -657,6 +677,33 @@ impl ModelFieldsValidator {
                             }
                             err
                         }));
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else if let Some((lookup_path, value)) = field
+                .lookup_path_collection
+                .lookup_paths(lookup_type)
+                .find_map(|path| path.json_get(json_object).ok().flatten().map(|v| (path, v)))
+            {
+                // fields with a wildcard (`...`) alias aren't added to the lookup tree above (it can only
+                // express exact key/index paths), so they're resolved here instead, directly against
+                // `json_object`. This is only reached for such fields, since every other field is either
+                // already found via the tree or genuinely missing (in which case this is a cheap extra miss).
+                match field.validator.validate(py, value.borrow_input(), state) {
+                    Ok(value) => {
+                        fields_set.add(&field.name)?;
+                        fields_set_count += 1;
+                        value
+                    }
+                    Err(ValError::Omit) => continue,
+                    Err(ValError::LineErrors(line_errors)) => {
+                        state.has_field_error = true;
+                        errors.extend(
+                            line_errors
+                                .into_iter()
+                                .map(|err| lookup_path.apply_error_loc(err, self.loc_by_alias, &field.name)),
+                        );
                         continue;
                     }
                     Err(err) => return Err(err),

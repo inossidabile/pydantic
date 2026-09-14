@@ -96,6 +96,32 @@ print(user)
 #> first_name='John' last_name='Doe'
 ```
 
+`AliasPath` also supports a `...` (`Ellipsis`) wildcard item. It maps the rest of the path over every
+element of the list found at that point, and collects the results into a new list. This is useful for
+projecting a single field out of a list of objects:
+
+```python {lint="skip"}
+from pydantic import BaseModel, Field, AliasPath
+
+
+class Blog(BaseModel):
+    name: str
+    authors: list[str] = Field(validation_alias=AliasPath('authors', ..., 'name'))
+
+
+blog = Blog.model_validate({
+    'name': 'Blog entry',
+    'authors': [{'name': 'Alice'}, {'name': 'Bob'}],
+})
+print(blog)
+#> name='Blog entry' authors=['Alice', 'Bob']
+```
+
+A path can only contain a single `...` wildcard. Elements for which the rest of the path doesn't
+resolve (a missing key, or an element that isn't a `dict`) are dropped rather than raising an error;
+if the value found at the wildcard's position isn't a list at all, the lookup is treated as not found,
+same as any other alias path that doesn't match the input.
+
 ## Using alias generators
 
 You can use the `alias_generator` parameter of [`Config`][pydantic.config.ConfigDict.alias_generator] to specify
