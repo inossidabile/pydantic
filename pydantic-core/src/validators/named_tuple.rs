@@ -12,7 +12,7 @@ use crate::errors::{ErrorType, ErrorTypeDefaults, LocItem, ValError, ValLineErro
 use crate::input::{
     BorrowInput, ConsumeIterator, Input, ValidatedDict, ValidatedTuple, ValidationMatch, input_as_python_instance,
 };
-use crate::lookup_key::{LookupPathCollection, LookupType};
+use crate::lookup_key::{LookupPathCollection, LookupType, PathItemString};
 use crate::tools::SchemaDict;
 use crate::validators::function::convert_err;
 
@@ -33,6 +33,11 @@ pub struct NamedTupleValidator {
     class: Py<PyType>,
     fields: Vec<NamedTupleField>,
     loc_by_alias: bool,
+    /// Root keys of fields which have a wildcard alias; these must always be excluded from "extra"
+    /// detection (named tuples always forbid extras) even when the particular key present in a given
+    /// input didn't resolve via that field (e.g. another alias choice, or the plain name, resolved
+    /// instead).
+    wildcard_extra_exempt_keys: AHashSet<PathItemString>,
     validate_by_alias: Option<bool>,
     validate_by_name: Option<bool>,
     name: String,
@@ -84,10 +89,17 @@ impl BuildValidator for NamedTupleValidator {
             });
         }
 
+        let wildcard_extra_exempt_keys: AHashSet<PathItemString> = fields
+            .iter()
+            .filter(|field| field.lookup_path_collection.has_wildcard())
+            .flat_map(|field| field.lookup_path_collection.root_keys().cloned())
+            .collect();
+
         Ok(CombinedValidator::NamedTuple(Self {
             class: class.into(),
             fields,
             loc_by_alias: config.get_as(intern!(py, "loc_by_alias"))?.unwrap_or(true),
+            wildcard_extra_exempt_keys,
             validate_by_alias: config.get_as(intern!(py, "validate_by_alias"))?,
             validate_by_name: config.get_as(intern!(py, "validate_by_name"))?,
             name,
@@ -237,6 +249,7 @@ impl NamedTupleValidator {
 
         dict.iterate(CheckExtras {
             used_keys,
+            wildcard_extra_exempt_keys: &self.wildcard_extra_exempt_keys,
             errors: &mut errors,
         })??;
 
@@ -263,6 +276,7 @@ impl NamedTupleValidator {
 
 struct CheckExtras<'a> {
     used_keys: AHashSet<&'a str>,
+    wildcard_extra_exempt_keys: &'a AHashSet<PathItemString>,
     errors: &'a mut Vec<ValLineError>,
 }
 
@@ -292,7 +306,8 @@ where
                 }
                 Err(err) => return Err(err),
             };
-            if !self.used_keys.contains(either_str.as_cow()?.as_ref()) {
+            let key = either_str.as_cow()?;
+            if !self.used_keys.contains(key.as_ref()) && !self.wildcard_extra_exempt_keys.contains(key.as_ref()) {
                 // Named tuples cannot hold extra fields, so extra keys are always forbidden:
                 self.errors.push(ValLineError::new_with_loc(
                     ErrorTypeDefaults::ExtraForbidden,

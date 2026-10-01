@@ -143,6 +143,18 @@ impl Location {
             }
         }
     }
+
+    /// The number of segments in this location.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::List(loc) => loc.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Serialize for Location {

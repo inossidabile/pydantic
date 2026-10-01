@@ -1,12 +1,14 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::convert::Infallible;
 use std::fmt;
+use std::sync::Arc;
 
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyAttributeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedStr;
-use pyo3::types::{PyDict, PyList, PyMapping, PyString};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PyMapping, PyString, PyTuple, PyType};
 
 use jiter::{JsonObject, JsonValue};
 use smallvec::SmallVec;
@@ -15,6 +17,13 @@ use crate::build_tools::py_schema_err;
 use crate::errors::{ErrorType, LocItem, Location, ValError, ValLineError, ValResult, py_err_string};
 use crate::input::StringMapping;
 use crate::tools::{mapping_get, py_err};
+
+static SEQUENCE_ABC: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+/// `collections.abc.Sequence`, used to recognize wildcard-mappable values beyond just `list`/`tuple`.
+fn get_sequence_abc(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    SEQUENCE_ABC.import(py, "collections.abc", "Sequence")
+}
 
 /// The possible choices for an alias value in Python
 #[derive(FromPyObject)]
@@ -97,6 +106,64 @@ impl LookupPath {
         self.get_impl(dict, PyDictMethods::get_item, |d, loc| Ok(loc.py_get_item(&d)))
     }
 
+    /// If the value found for a wildcard segment isn't a sequence, it's not found (not an error) -
+    /// we never want to iterate over e.g. strings, bytes or dicts/mappings as if they were a sequence
+    /// of items, even though `str`/`bytes`/`bytearray` are technically registered as
+    /// `collections.abc.Sequence`.
+    fn wildcard_items<'py>(value: &Bound<'py, PyAny>) -> PyResult<Option<Vec<Bound<'py, PyAny>>>> {
+        if let Ok(list) = value.cast::<PyList>() {
+            return Ok(Some(list.iter().collect()));
+        }
+        if let Ok(tuple) = value.cast::<PyTuple>() {
+            return Ok(Some(tuple.iter().collect()));
+        }
+        if value.is_instance_of::<PyString>()
+            || value.is_instance_of::<PyBytes>()
+            || value.is_instance_of::<PyByteArray>()
+        {
+            return Ok(None);
+        }
+        let sequence_abc = get_sequence_abc(value.py())?;
+        if !value.is_instance(sequence_abc)? {
+            return Ok(None);
+        }
+        let len = value.len()?;
+        let items: PyResult<Vec<_>> = (0..len).map(|i| value.get_item(i)).collect();
+        Ok(Some(items?))
+    }
+
+    /// Resolves `rest` against `value`, forking into a new list at each wildcard segment by mapping
+    /// the remaining path over every item of the (list or tuple) value found there. Items which don't
+    /// resolve past the wildcard are omitted rather than causing the whole lookup to fail.
+    fn resolve_rest<'py>(
+        value: Bound<'py, PyAny>,
+        rest: &[PathItem],
+        nested_lookup: &impl Fn(Bound<'py, PyAny>, &PathItem) -> PyResult<Option<Bound<'py, PyAny>>>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let Some((first, remaining)) = rest.split_first() else {
+            return Ok(Some(value));
+        };
+
+        if matches!(first, PathItem::Wildcard) {
+            let Some(items) = Self::wildcard_items(&value)? else {
+                return Ok(None);
+            };
+            let py = value.py();
+            let mut resolved = Vec::with_capacity(items.len());
+            for item in items {
+                if let Some(v) = Self::resolve_rest(item, remaining, nested_lookup)? {
+                    resolved.push(v);
+                }
+            }
+            Ok(Some(PyList::new(py, resolved)?.into_any()))
+        } else {
+            match nested_lookup(value, first)? {
+                Some(next) => Self::resolve_rest(next, remaining, nested_lookup),
+                None => Ok(None),
+            }
+        }
+    }
+
     pub fn py_get_string_mapping_item<'py>(&self, dict: &Bound<'py, PyDict>) -> ValResult<Option<StringMapping<'py>>> {
         if let Some(py_any) = self.py_get_dict_item(dict)? {
             let value = StringMapping::new_value(py_any)?;
@@ -137,43 +204,71 @@ impl LookupPath {
         }
     }
 
-    pub fn json_get<'a, 'data>(&self, dict: &'a JsonObject<'data>) -> ValResult<Option<&'a JsonValue<'data>>> {
+    pub fn json_get<'a, 'data>(&self, dict: &'a JsonObject<'data>) -> ValResult<Option<Cow<'a, JsonValue<'data>>>> {
         // FIXME: use of find_map in here probably leads to quadratic complexity
 
         // first step is different as the first step is a key lookup
-        if let Some(v) = dict
+        let Some(mut value) = dict
             .iter()
             .rev()
             .find_map(|(k, v)| (k == self.first_key()).then_some(v))
-        // fold the rest of the path over the found value
-            && let Some(v) = self.rest.iter().try_fold(v, |d, loc| loc.json_get(d))
-        {
-            return Ok(Some(v));
-        }
-
-        Ok(None)
-    }
-
-    fn get_impl<'s, 'a, SourceT, OutputT: 'a>(
-        &'s self,
-        source: &'a SourceT,
-        lookup: impl Fn(&'a SourceT, &'s PathItemString) -> PyResult<Option<OutputT>>,
-        nested_lookup: impl Fn(OutputT, &'s PathItem) -> PyResult<Option<OutputT>>,
-    ) -> PyResult<Option<OutputT>> {
-        let Some(mut value) = lookup(source, &self.first_item)? else {
+        else {
             return Ok(None);
         };
 
-        // iterate over the path and plug each value into the value from the last step
-        for loc in &self.rest {
-            value = match nested_lookup(value, loc)? {
-                Some(v) => v,
+        // walk the rest of the path, staying purely borrowed for as long as possible - a wildcard
+        // segment has no representation in the original document, so from that point on we have to
+        // build owned values instead
+        for (i, item) in self.rest.iter().enumerate() {
+            if matches!(item, PathItem::Wildcard) {
+                return Ok(Self::json_resolve_wildcards(value, &self.rest[i..]).map(Cow::Owned));
+            }
+            match item.json_get(value) {
+                Some(v) => value = v,
                 None => return Ok(None),
             }
         }
 
-        // Successfully found an item, return it
-        Ok(Some(value))
+        Ok(Some(Cow::Borrowed(value)))
+    }
+
+    /// Resolves `rest` (which must start with a wildcard, or be empty) against `value`, always producing
+    /// an owned value since the result of mapping over a wildcard doesn't exist anywhere in the original
+    /// document. Items which don't resolve past the wildcard are omitted rather than causing the whole
+    /// lookup to fail.
+    fn json_resolve_wildcards<'data>(value: &JsonValue<'data>, rest: &[PathItem]) -> Option<JsonValue<'data>> {
+        let Some((first, remaining)) = rest.split_first() else {
+            return Some(value.clone());
+        };
+
+        if matches!(first, PathItem::Wildcard) {
+            let JsonValue::Array(array) = value else {
+                return None;
+            };
+            let mut resolved = Vec::with_capacity(array.len());
+            for item in array.iter() {
+                if let Some(v) = Self::json_resolve_wildcards(item, remaining) {
+                    resolved.push(v);
+                }
+            }
+            Some(JsonValue::Array(Arc::new(resolved)))
+        } else {
+            let next = first.json_get(value)?;
+            Self::json_resolve_wildcards(next, remaining)
+        }
+    }
+
+    fn get_impl<'s, 'a, 'py, SourceT>(
+        &'s self,
+        source: &'a SourceT,
+        lookup: impl Fn(&'a SourceT, &'s PathItemString) -> PyResult<Option<Bound<'py, PyAny>>>,
+        nested_lookup: impl Fn(Bound<'py, PyAny>, &PathItem) -> PyResult<Option<Bound<'py, PyAny>>>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let Some(value) = lookup(source, &self.first_item)? else {
+            return Ok(None);
+        };
+
+        Self::resolve_rest(value, &self.rest, &nested_lookup)
     }
 
     pub fn loc(&self) -> Location {
@@ -211,6 +306,11 @@ impl LookupPath {
     pub fn rest(&self) -> &[PathItem] {
         &self.rest
     }
+
+    /// Whether this path contains a wildcard (`...`) segment anywhere.
+    pub fn has_wildcard(&self) -> bool {
+        self.rest.iter().any(|item| matches!(item, PathItem::Wildcard))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +319,8 @@ pub(crate) enum PathItem {
     /// integer key, used to get items from a list, tuple OR a dict with int keys `dict[int, ...]` (python only)
     Pos(usize),
     Neg(usize),
+    /// `...`, maps the rest of the path over every item of a list/tuple (or JSON array) found at this point
+    Wildcard,
 }
 
 /// String type key, used to get or identify items from a dict or anything that implements `__getitem__`
@@ -254,6 +356,7 @@ impl fmt::Display for PathItem {
             Self::S(key) => key.fmt(f),
             Self::Pos(key) => write!(f, "{key}"),
             Self::Neg(key) => write!(f, "-{key}"),
+            Self::Wildcard => write!(f, "*"),
         }
     }
 }
@@ -271,6 +374,7 @@ impl<'py> IntoPyObject<'py> for &'_ PathItem {
                 let neg_value = -(*val as i64);
                 neg_value.into_bound_py_any(py)
             }
+            PathItem::Wildcard => Ok(PyEllipsis::get(py).to_owned().into_any()),
         }
     }
 }
@@ -293,6 +397,10 @@ impl PathItem {
             }
             Err(e) => e.into_inner(),
         };
+
+        if obj.cast::<PyEllipsis>().is_ok() {
+            return Ok(Self::Wildcard);
+        }
 
         if let Ok(usize_key) = obj.extract::<usize>() {
             Ok(Self::Pos(usize_key))
@@ -334,7 +442,7 @@ impl PathItem {
                         None
                     }
                 }
-                Self::S(..) => None,
+                Self::S(..) | Self::Wildcard => None,
             },
             _ => None,
         }
@@ -352,6 +460,7 @@ impl PathItem {
             Self::S(PathItemString(key)) => LocItem::from(key.clone()),
             Self::Pos(index) => LocItem::from(*index),
             Self::Neg(index) => LocItem::from(-(*index as i64)),
+            Self::Wildcard => LocItem::from("*"),
         }
     }
 }
@@ -426,6 +535,16 @@ impl LookupPathCollection {
             return first_alias.loc();
         }
         self.by_name.loc()
+    }
+
+    /// Whether any of this field's alias paths contain a wildcard (`...`) segment.
+    pub fn has_wildcard(&self) -> bool {
+        self.by_alias.iter().any(LookupPath::has_wildcard)
+    }
+
+    /// The root (first) key of the by-name path and of every by-alias path.
+    pub fn root_keys(&self) -> impl Iterator<Item = &PathItemString> {
+        std::iter::once(self.by_name.first_item()).chain(self.by_alias.iter().map(LookupPath::first_item))
     }
 }
 

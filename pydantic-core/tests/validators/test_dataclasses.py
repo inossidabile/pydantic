@@ -2,6 +2,7 @@ import dataclasses
 import platform
 import re
 import weakref
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 import pytest
@@ -185,6 +186,188 @@ def test_aliases(py_and_json: PyAndJson):
     assert v.validate_test({'Apple': 'a', 'Banana': ['x', 'false'], 'Carrot': {'v': '42'}}) == (
         {'a': 'a', 'b': False},
         (42,),
+    )
+
+
+def test_alias_path_wildcard(py_and_json: PyAndJson):
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.list_schema(core_schema.str_schema()),
+                validation_alias=['authors', ..., 'name'],
+            ),
+        ],
+    )
+    v = py_and_json(schema)
+    assert v.validate_test({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}) == (
+        {'field_a': ['Alice', 'Bob']},
+        None,
+    )
+
+
+def test_alias_path_wildcard_non_sequence_value_is_absent():
+    # if the wildcard value is not a sequence, the whole path is absent rather than raising - a
+    # required field with no default therefore reports an ordinary missing error, not a crash
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.list_schema(core_schema.str_schema()),
+                validation_alias=['authors', ..., 'name'],
+            ),
+        ],
+    )
+    v = SchemaValidator(schema)
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python({'authors': 'not-a-sequence'})
+    assert exc_info.value.errors(include_url=False)[0]['type'] == 'missing'
+
+
+def test_alias_path_wildcard_sequence_enumeration_exception_propagates():
+    # a genuine exception raised while enumerating a custom Sequence found at the wildcard
+    # position itself (not just a plain lookup miss) must propagate too, exactly like any other
+    # segment of the path - it must not be swallowed into "value absent"
+    class RaisingSequence(Sequence):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            if index == 1:
+                raise RuntimeError('boom')
+            return {'name': 'Alice'}
+
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.list_schema(core_schema.str_schema()),
+                validation_alias=['authors', ..., 'name'],
+            ),
+        ],
+    )
+    v = SchemaValidator(schema)
+    with pytest.raises(RuntimeError, match='boom'):
+        v.validate_python({'authors': RaisingSequence()})
+
+
+def test_alias_wildcard_extra_forbid(py_and_json: PyAndJson):
+    # a wildcard alias's root key(s) must be excluded from extra='forbid' detection
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.list_schema(core_schema.str_schema()),
+                validation_alias=['authors', ..., 'name'],
+            ),
+        ],
+        extra_behavior='forbid',
+    )
+    v = py_and_json(schema)
+    assert v.validate_test({'authors': [{'name': 'Alice'}]}) == ({'field_a': ['Alice']}, None)
+
+
+def test_alias_wildcard_extra_forbid_by_name(py_and_json: PyAndJson):
+    # the plain field name is also excluded from lookup once the field has a wildcard alias, so
+    # it must be excluded from "extra" detection too
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.list_schema(core_schema.str_schema()),
+                validation_alias=['authors', ..., 'name'],
+            ),
+        ],
+        extra_behavior='forbid',
+    )
+    v = py_and_json(schema, {'validate_by_name': True})
+    assert v.validate_test({'field_a': ['Alice']}) == ({'field_a': ['Alice']}, None)
+
+
+def test_alias_wildcard_extra_forbid_by_name_when_validate_by_name_disabled(py_and_json: PyAndJson):
+    # regression test: the plain field name is exempt from extra='forbid' unconditionally, not
+    # just when by-name lookup is enabled and actually consumes it - with validate_by_name
+    # disabled and the alias's own root absent, the plain name is present but genuinely unused,
+    # and must still not be flagged as extra
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.with_default_schema(core_schema.list_schema(core_schema.str_schema()), default=[]),
+                validation_alias=['authors', ..., 'name'],
+            ),
+        ],
+        extra_behavior='forbid',
+    )
+    v = py_and_json(schema, {'validate_by_name': False})
+    assert v.validate_test({'field_a': ['Alice']}) == ({'field_a': []}, None)
+
+
+def test_alias_choices_wildcard_extra_forbid_multiple_wildcards(py_and_json: PyAndJson):
+    # regression test: with more than one wildcard choice (plus a plain one), every choice's root
+    # key must be excluded from "extra" detection, not just a single special-cased wildcard root
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.list_schema(core_schema.str_schema()),
+                validation_alias=[['authors', ..., 'name'], ['editors', ..., 'name'], ['writers']],
+            ),
+        ],
+        extra_behavior='forbid',
+    )
+    v = py_and_json(schema)
+    assert v.validate_test({'authors': [{'name': 'A'}]}) == ({'field_a': ['A']}, None)
+    assert v.validate_test({'editors': [{'name': 'E'}]}) == ({'field_a': ['E']}, None)
+    assert v.validate_test({'writers': ['W']}) == ({'field_a': ['W']}, None)
+
+
+def test_alias_choices_wildcard_extra_forbid_co_present_roots(py_and_json: PyAndJson):
+    # regression test: a broken implementation might compute the extra-forbid exemption from
+    # "was this specific root actually used" rather than "is this root declared as a choice on a
+    # wildcard-bearing field" - those two only differ when more than one choice's root is present
+    # at once. Here both the winning wildcard root and a losing, unused plain root are present
+    # together; the losing root must still be exempt, not flagged as extra_forbidden.
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.list_schema(core_schema.str_schema()),
+                validation_alias=[['authors', ..., 'name'], ['writers']],
+            ),
+        ],
+        extra_behavior='forbid',
+    )
+    v = py_and_json(schema)
+    assert v.validate_test({'authors': [{'name': 'A'}], 'writers': ['W']}) == ({'field_a': ['A']}, None)
+
+
+def test_alias_choices_wildcard_extra_allow_surfaces_unused_root(py_and_json: PyAndJson):
+    # under extra='allow', a wildcard/choice root that ends up unused because a different choice
+    # resolved must still surface as an extra field, exactly as if it had never been exempted
+    schema = core_schema.dataclass_args_schema(
+        'MyDataclass',
+        [
+            core_schema.dataclass_field(
+                name='field_a',
+                schema=core_schema.list_schema(core_schema.str_schema()),
+                validation_alias=[['writers'], ['authors', ..., 'name']],
+            ),
+        ],
+        extra_behavior='allow',
+    )
+    v = py_and_json(schema)
+    assert v.validate_test({'writers': ['W'], 'authors': [{'name': 'A'}]}) == (
+        {'field_a': ['W'], 'authors': [{'name': 'A'}]},
+        None,
     )
 
 

@@ -26,6 +26,16 @@ impl LookupTree {
         for (field_index, field) in fields.iter().enumerate() {
             let collection = get_field_collection(field);
 
+            if collection.has_wildcard() {
+                // wildcard (`...`) segments can't be represented in the lookup tree, since it only
+                // supports exact keys/indices. Fields with a wildcard alias are resolved through a
+                // separate lookup pass instead, so skip adding any of their paths here - including
+                // non-wildcard alias choices and the plain name - which keeps priority ordering
+                // between aliases intact (the tree would otherwise let a later, lower-priority plain
+                // alias silently win over an earlier wildcard one).
+                continue;
+            }
+
             add_path_to_map(
                 &mut tree.inner,
                 &collection.by_name,
@@ -164,6 +174,8 @@ fn add_path_to_map(map: &mut AHashMap<PathItemString, LookupTreeNode>, path: &Lo
             PathItem::S(s) => tree_node.map.entry(s.clone()).or_default(),
             PathItem::Pos(i) => tree_node.list.entry(*i as i64).or_default(),
             PathItem::Neg(i) => tree_node.list.entry(-(*i as i64)).or_default(),
+            // callers never add a path with a wildcard segment to the tree
+            PathItem::Wildcard => unreachable!("wildcard paths are not added to the lookup tree"),
         };
 
         current = next;
@@ -180,6 +192,8 @@ fn add_path_to_map(map: &mut AHashMap<PathItemString, LookupTreeNode>, path: &Lo
         PathItem::Neg(i) => {
             add_field_to_map(&mut tree_node.list, -(*i as i64), info);
         }
+        // callers never add a path with a wildcard segment to the tree
+        PathItem::Wildcard => unreachable!("wildcard paths are not added to the lookup tree"),
     }
 }
 

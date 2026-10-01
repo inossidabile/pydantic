@@ -17,6 +17,7 @@ use crate::input::{
 };
 use crate::lookup_key::LookupPathCollection;
 use crate::lookup_key::LookupType;
+use crate::lookup_key::PathItemString;
 use crate::tools::SchemaDict;
 use crate::validators::function::convert_err;
 
@@ -45,6 +46,10 @@ pub struct DataclassArgsValidator {
     extra_behavior: ExtraBehavior,
     extras_validator: Option<Arc<CombinedValidator>>,
     loc_by_alias: bool,
+    /// Root keys of fields which have a wildcard alias; under `extra='forbid'` these must be excluded
+    /// from "extra" detection even when the particular key present in a given input didn't resolve via
+    /// that field (e.g. another alias choice, or the plain field name, resolved instead).
+    wildcard_extra_exempt_keys: AHashSet<PathItemString>,
     validate_by_alias: Option<bool>,
     validate_by_name: Option<bool>,
 }
@@ -118,6 +123,12 @@ impl BuildValidator for DataclassArgsValidator {
         let dataclass_name: String = schema.get_as_req(intern!(py, "dataclass_name"))?;
         let validator_name = format!("dataclass-args[{dataclass_name}]");
 
+        let wildcard_extra_exempt_keys: AHashSet<PathItemString> = fields
+            .iter()
+            .filter(|field| field.lookup_path_collection.has_wildcard())
+            .flat_map(|field| field.lookup_path_collection.root_keys().cloned())
+            .collect();
+
         Ok(CombinedValidator::DataclassArgs(Self {
             fields,
             positional_count,
@@ -127,6 +138,7 @@ impl BuildValidator for DataclassArgsValidator {
             extra_behavior,
             extras_validator,
             loc_by_alias: config.get_as(intern!(py, "loc_by_alias"))?.unwrap_or(true),
+            wildcard_extra_exempt_keys,
             validate_by_alias: config.get_as(intern!(py, "validate_by_alias"))?,
             validate_by_name: config.get_as(intern!(py, "validate_by_name"))?,
         })
@@ -310,7 +322,10 @@ impl Validator for DataclassArgsValidator {
                     .map(ValidationMatch::into_inner)
                 {
                     Ok(either_str) => {
-                        if !used_keys.contains(either_str.as_cow()?.as_ref()) {
+                        let key = either_str.as_cow()?;
+                        let wildcard_exempt = extra_behavior == ExtraBehavior::Forbid
+                            && self.wildcard_extra_exempt_keys.contains(key.as_ref());
+                        if !used_keys.contains(key.as_ref()) && !wildcard_exempt {
                             // Unknown / extra field
                             match extra_behavior {
                                 ExtraBehavior::Forbid => {

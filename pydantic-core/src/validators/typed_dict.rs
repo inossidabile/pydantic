@@ -15,6 +15,7 @@ use crate::input::ValidationMatch;
 use crate::input::{Input, ValidatedDict};
 use crate::lookup_key::LookupPathCollection;
 use crate::lookup_key::LookupType;
+use crate::lookup_key::PathItemString;
 use crate::tools::SchemaDict;
 use ahash::AHashSet;
 use jiter::PartialMode;
@@ -38,6 +39,10 @@ pub struct TypedDictValidator {
     extras_validator: Option<Arc<CombinedValidator>>,
     strict: bool,
     loc_by_alias: bool,
+    /// Root keys of fields which have a wildcard alias; under `extra='forbid'` these must be excluded
+    /// from "extra" detection even when the particular key present in a given input didn't resolve via
+    /// that field (e.g. another alias choice, or the plain field name, resolved instead).
+    wildcard_extra_exempt_keys: AHashSet<PathItemString>,
     validate_by_alias: Option<bool>,
     validate_by_name: Option<bool>,
     cls_name: Option<String>,
@@ -122,12 +127,20 @@ impl BuildValidator for TypedDictValidator {
                 validator,
             });
         }
+
+        let wildcard_extra_exempt_keys: AHashSet<PathItemString> = fields
+            .iter()
+            .filter(|field| field.lookup_path_collection.has_wildcard())
+            .flat_map(|field| field.lookup_path_collection.root_keys().cloned())
+            .collect();
+
         Ok(CombinedValidator::TypedDict(Self {
             fields,
             extra_behavior,
             extras_validator,
             strict,
             loc_by_alias: config.get_as(intern!(py, "loc_by_alias"))?.unwrap_or(true),
+            wildcard_extra_exempt_keys,
             validate_by_alias: config.get_as(intern!(py, "validate_by_alias"))?,
             validate_by_name: config.get_as(intern!(py, "validate_by_name"))?,
             cls_name,
@@ -283,6 +296,7 @@ impl Validator for TypedDictValidator {
             struct ValidateExtras<'a, 's, 'py> {
                 py: Python<'py>,
                 used_keys: AHashSet<&'a str>,
+                wildcard_extra_exempt_keys: &'a AHashSet<PathItemString>,
                 errors: &'a mut Vec<ValLineError>,
                 extras_validator: Option<&'a CombinedValidator>,
                 output_dict: &'a Bound<'py, PyDict>,
@@ -319,7 +333,10 @@ impl Validator for TypedDictValidator {
                             Err(err) => return Err(err),
                         };
                         let cow = either_str.as_cow()?;
-                        if self.used_keys.contains(cow.as_ref()) {
+                        if self.used_keys.contains(cow.as_ref())
+                            || (self.extra_behavior == ExtraBehavior::Forbid
+                                && self.wildcard_extra_exempt_keys.contains(cow.as_ref()))
+                        {
                             continue;
                         }
 
@@ -368,6 +385,7 @@ impl Validator for TypedDictValidator {
 
             dict.iterate(ValidateExtras {
                 used_keys,
+                wildcard_extra_exempt_keys: &self.wildcard_extra_exempt_keys,
                 py,
                 errors: &mut errors,
                 extras_validator: self.extras_validator.as_deref(),
@@ -388,5 +406,44 @@ impl Validator for TypedDictValidator {
 
     fn get_name(&self) -> &str {
         self.cls_name.as_deref().unwrap_or(Self::EXPECTED_TYPE)
+    }
+}
+
+impl TypedDictValidator {
+    /// Whether `key` is a root key (by-name or any alias) of one of this TypedDict's own declared
+    /// fields - used by callers embedding this validator as an unpacked-kwargs schema to tell
+    /// whether a given incoming key could ever legitimately populate a field, as opposed to only
+    /// ever being reported as extra.
+    pub(crate) fn declares_root_key(&self, key: &str) -> bool {
+        self.fields
+            .iter()
+            .any(|f| f.lookup_path_collection.root_keys().any(|root| &**root == key))
+    }
+
+    /// This TypedDict's own `extra_behavior`, accounting for a per-call config override - the
+    /// same value `TypedDictValidator::validate` itself uses, so a caller can tell whether
+    /// forwarding an extra key here would actually raise `extra_forbidden`.
+    pub(crate) fn effective_extra_behavior(&self, state: &ValidationState) -> ExtraBehavior {
+        state.extra_behavior_or(self.extra_behavior)
+    }
+}
+
+/// Resolves `validator` to its underlying `TypedDictValidator`, following through a
+/// `DefinitionRef` indirection (as used by `definitions_schema`/`definition_reference_schema`) if
+/// present - a `var_kwargs_schema` referencing a typed-dict via a definition ref must be
+/// recognized here just as readily as one embedded directly, so a caller relying on this to avoid
+/// an unnecessary second validation pass (see `arguments.rs`/`arguments_v3.rs`) doesn't silently
+/// fall back to it.
+pub(crate) fn resolve_typed_dict<R>(
+    validator: &CombinedValidator,
+    f: impl FnOnce(Option<&TypedDictValidator>) -> R,
+) -> R {
+    match validator {
+        CombinedValidator::TypedDict(td) => f(Some(td)),
+        CombinedValidator::DefinitionRef(def_ref) => def_ref.read(|inner| match inner {
+            Some(inner_validator) => resolve_typed_dict(inner_validator, f),
+            None => f(None),
+        }),
+        _ => f(None),
     }
 }
