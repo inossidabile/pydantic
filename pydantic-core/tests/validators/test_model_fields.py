@@ -2,7 +2,7 @@ import math
 import os
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -823,6 +823,756 @@ def test_alias_error_loc_alias(py_and_json: PyAndJson):
     assert exc_info.value.errors(include_url=False) == [
         {'type': 'missing', 'loc': ('foo', 'x'), 'msg': 'Field required', 'input': {}}
     ]
+
+
+@pytest.mark.parametrize(
+    'input_value,expected',
+    [
+        ({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}, ({'field_a': ['Alice', 'Bob']}, None, {'field_a'})),
+        ({'authors': []}, ({'field_a': []}, None, {'field_a'})),
+        ({'authors': ({'name': 'Alice'},)}, ({'field_a': ['Alice']}, None, {'field_a'})),
+        # an element that doesn't resolve past the wildcard is omitted, not an error
+        ({'authors': [{'name': 'Alice'}, {}]}, ({'field_a': ['Alice']}, None, {'field_a'})),
+        ({'authors': [{}, {}]}, ({'field_a': []}, None, {'field_a'})),
+        # whatever the error is, its loc must pass through the wildcard segment as '*'
+        ({'authors': 'not-a-list'}, Err(r'authors\.\*\.name')),
+    ],
+    ids=repr,
+)
+def test_alias_path_wildcard(py_and_json: PyAndJson, input_value, expected):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    if isinstance(expected, Err):
+        with pytest.raises(ValidationError, match=expected.message):
+            v.validate_test(input_value)
+    else:
+        assert v.validate_test(input_value) == expected
+
+
+def test_alias_path_wildcard_generic_sequence():
+    # a wildcard must map over any `collections.abc.Sequence`, not just list/tuple specifically -
+    # Python input only, since a custom Sequence type has no JSON representation
+    class Seq(Sequence):
+        def __init__(self, items):
+            self._items = list(items)
+
+        def __getitem__(self, i):
+            return self._items[i]
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+    v = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.list_schema(core_schema.str_schema()),
+                    validation_alias=['authors', ..., 'name'],
+                )
+            },
+        )
+    )
+    input_value = {'authors': Seq([{'name': 'Alice'}, {'name': 'Bob'}])}
+    assert v.validate_python(input_value) == ({'field_a': ['Alice', 'Bob']}, None, {'field_a'})
+
+
+def test_alias_path_wildcard_bare(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ...],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'any'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}]}) == ({'field_a': [{'name': 'Alice'}]}, None, {'field_a'})
+
+
+def test_alias_path_wildcard_nested(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['groups', ..., ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'list', 'items_schema': {'type': 'str'}}},
+                }
+            },
+        }
+    )
+    input_value = {'groups': [[{'name': 'A'}, {'name': 'B'}], [{'name': 'C'}]]}
+    assert v.validate_test(input_value) == ({'field_a': [['A', 'B'], ['C']]}, None, {'field_a'})
+
+
+def test_alias_path_wildcard_three_levels(py_and_json: PyAndJson):
+    # recursion isn't capped at two wildcard levels
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['a', ..., ..., ..., 'v'],
+                    'schema': {
+                        'type': 'list',
+                        'items_schema': {
+                            'type': 'list',
+                            'items_schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                        },
+                    },
+                }
+            },
+        }
+    )
+    input_value = {'a': [[[{'v': 'x'}, {'v': 'y'}], [{'v': 'z'}]], [[{'v': 'w'}]]]}
+    assert v.validate_test(input_value) == ({'field_a': [[['x', 'y'], ['z']], [['w']]]}, None, {'field_a'})
+
+
+def test_alias_path_wildcard_nested_terminal_wildcard(py_and_json: PyAndJson):
+    # a terminal wildcard (identity projection) applies at any wildcard depth, not only when it's
+    # the sole/first wildcard in the path
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['groups', ..., 'members', ...],
+                    'schema': {
+                        'type': 'list',
+                        'items_schema': {
+                            'type': 'list',
+                            'items_schema': {'type': 'dict', 'values_schema': {'type': 'any'}},
+                        },
+                    },
+                }
+            },
+        }
+    )
+    input_value = {'groups': [{'members': [{'name': 'A'}, {'name': 'B'}]}, {'members': [{'name': 'C'}]}]}
+    assert v.validate_test(input_value) == (
+        {'field_a': [[{'name': 'A'}, {'name': 'B'}], [{'name': 'C'}]]},
+        None,
+        {'field_a'},
+    )
+
+
+def test_alias_path_wildcard_nested_partial_omission(py_and_json: PyAndJson):
+    # only the inner element that fails to resolve past the second wildcard is omitted; the
+    # surrounding nested-list shape (including the untouched second group) is otherwise preserved
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['groups', ..., ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'list', 'items_schema': {'type': 'str'}}},
+                }
+            },
+        }
+    )
+    input_value = {'groups': [[{'name': 'A'}, {}], [{'name': 'C'}]]}
+    assert v.validate_test(input_value) == ({'field_a': [['A'], ['C']]}, None, {'field_a'})
+
+
+def test_alias_path_wildcard_integer_index_failure_omitted(py_and_json: PyAndJson):
+    # omission on a post-wildcard resolution failure applies to integer-index lookups too, not just
+    # dict-key lookups
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['groups', ..., 0],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    input_value = {'groups': [['first'], []]}
+    assert v.validate_test(input_value) == ({'field_a': ['first']}, None, {'field_a'})
+
+
+def test_alias_path_wildcard_from_attributes_failure_omitted():
+    # omission on a post-wildcard resolution failure applies to attribute lookups (from_attributes)
+    # too, not just dict-key lookups - Python input only, since from_attributes is a Python-object
+    # input mode with no JSON equivalent
+    v = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.list_schema(core_schema.str_schema()),
+                    validation_alias=['authors', ..., 'name'],
+                )
+            },
+            from_attributes=True,
+        )
+    )
+    input_value = Cls(authors=[Cls(name='Alice'), Cls()])
+    assert v.validate_python(input_value) == ({'field_a': ['Alice']}, None, {'field_a'})
+
+
+def test_alias_path_wildcard_prefix_exception_propagates():
+    # omission only covers ordinary lookup misses (a missing key/index/attribute) - a genuine
+    # exception raised while resolving a segment *before* the wildcard is reached must still
+    # propagate as an error, exactly as it does for a wildcard-free path, rather than being
+    # swallowed into a "missing" field. Python input only (from_attributes has no JSON equivalent).
+    class Broken:
+        @property
+        def broken(self):
+            raise RuntimeError('boom')
+
+    class Root:
+        def __init__(self):
+            self.root = Broken()
+
+    v_wildcard = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.list_schema(core_schema.str_schema()),
+                    validation_alias=['root', 'broken', ..., 'name'],
+                )
+            },
+            from_attributes=True,
+        )
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        v_wildcard.validate_python(Root())
+    assert exc_info.value.errors(include_url=False)[0]['type'] == 'get_attribute_error'
+
+    # the plain (wildcard-free) path must behave identically for the same prefix
+    v_plain = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.str_schema(),
+                    validation_alias=['root', 'broken', 'name'],
+                )
+            },
+            from_attributes=True,
+        )
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        v_plain.validate_python(Root())
+    assert exc_info.value.errors(include_url=False)[0]['type'] == 'get_attribute_error'
+
+
+def test_alias_path_wildcard_suffix_exception_propagates():
+    # omission only covers ordinary lookup misses - a genuine exception raised while resolving
+    # the remaining path *against an element discovered by the wildcard* must still propagate as
+    # an error too, exactly like a prefix exception does, rather than being caught by whatever
+    # per-element resolution loop maps the remaining path over each element. Python input only
+    # (from_attributes has no JSON equivalent).
+    class Broken:
+        @property
+        def name(self):
+            raise RuntimeError('boom')
+
+    class Root:
+        def __init__(self):
+            self.authors = [Broken()]
+
+    v_wildcard = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.list_schema(core_schema.str_schema()),
+                    validation_alias=['authors', ..., 'name'],
+                )
+            },
+            from_attributes=True,
+        )
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        v_wildcard.validate_python(Root())
+    assert exc_info.value.errors(include_url=False)[0]['type'] == 'get_attribute_error'
+
+    # the plain (wildcard-free) path must behave identically for the same suffix
+    class RootPlain:
+        def __init__(self):
+            self.author = Broken()
+
+    v_plain = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.str_schema(),
+                    validation_alias=['author', 'name'],
+                )
+            },
+            from_attributes=True,
+        )
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        v_plain.validate_python(RootPlain())
+    assert exc_info.value.errors(include_url=False)[0]['type'] == 'get_attribute_error'
+
+
+def test_alias_path_wildcard_sequence_enumeration_exception_propagates():
+    # a genuine exception raised while enumerating a custom Sequence found at the wildcard
+    # position itself (not just a plain lookup miss) must propagate too, exactly like any other
+    # segment of the path - it must not be swallowed into "value absent". Python input only.
+    class RaisingSequence(Sequence):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            if index == 1:
+                raise RuntimeError('boom')
+            return {'name': 'Alice'}
+
+    v = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.list_schema(core_schema.str_schema()),
+                    validation_alias=['authors', ..., 'name'],
+                )
+            },
+        )
+    )
+    with pytest.raises(RuntimeError, match='boom'):
+        v.validate_python({'authors': RaisingSequence()})
+
+
+def test_alias_path_wildcard_sequence_enumeration_type_error_propagates():
+    # same as above, but with TypeError specifically - a plausible implementation mistake is to
+    # treat TypeError as an ordinary lookup miss (it is one elsewhere, e.g. applying a string key
+    # to a list during normal segment resolution), but during wildcard enumeration it is not: a
+    # len-1 Sequence raising TypeError from a valid index is a genuine exception, not a miss.
+    class RaisingTypeError(Sequence):
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            raise TypeError('boom')
+
+    v = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.list_schema(core_schema.str_schema()),
+                    validation_alias=['authors', ..., 'name'],
+                )
+            },
+        )
+    )
+    with pytest.raises(TypeError, match='boom'):
+        v.validate_python({'authors': RaisingTypeError()})
+
+
+def test_alias_path_wildcard_bytes_value_is_not_treated_as_a_sequence():
+    # bytes (and bytearray) are technically registered as collections.abc.Sequence, but must not
+    # be iterated element-by-element at a wildcard position, exactly like str
+    v = SchemaValidator(
+        core_schema.model_fields_schema(
+            fields={
+                'field_a': core_schema.model_field(
+                    core_schema.list_schema(core_schema.str_schema()),
+                    validation_alias=['authors', ..., 'name'],
+                )
+            },
+        )
+    )
+    for value in (b'ab', bytearray(b'ab')):
+        with pytest.raises(ValidationError) as exc_info:
+            v.validate_python({'authors': value})
+        assert exc_info.value.errors(include_url=False)[0]['type'] == 'missing'
+
+
+def test_alias_choices_wildcard(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['writers'], ['authors', ..., 'name']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'writers': ['X', 'Y'], 'authors': [{'name': 'A'}]}) == (
+        {'field_a': ['X', 'Y']},
+        None,
+        {'field_a'},
+    )
+    assert v.validate_test({'authors': [{'name': 'A'}]}) == ({'field_a': ['A']}, None, {'field_a'})
+
+
+def test_alias_choices_wildcard_listed_first(py_and_json: PyAndJson):
+    # regression test: a wildcard alias listed *before* a plain alias must still win when both are
+    # present, for both python and json input - the json fast path used to only track the plain
+    # alias in its lookup tree, so it always won regardless of declared priority
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['authors', ..., 'name'], ['writers']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'writers': ['X', 'Y'], 'authors': [{'name': 'A'}]}) == (
+        {'field_a': ['A']},
+        None,
+        {'field_a'},
+    )
+    assert v.validate_test({'writers': ['X', 'Y']}) == ({'field_a': ['X', 'Y']}, None, {'field_a'})
+
+
+def test_alias_path_wildcard_error_loc(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        },
+        {'loc_by_alias': True},
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}) == (
+        {'field_a': ['Alice', 'Bob']},
+        None,
+        {'field_a'},
+    )
+    # an element that doesn't resolve past the wildcard is omitted, not an error; but a value that does
+    # resolve and then fails its item schema still errors, with the wildcard segment shown as '*'
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_test({'authors': [{'name': 'Alice'}, {'name': 123}]})
+    errors = exc_info.value.errors(include_url=False)
+    assert errors[0]['type'] == 'string_type'
+    assert errors[0]['loc'] == ('authors', '*', 'name', 1)
+    # a non-list value at the wildcard position is not found; for a required field that's a missing error
+    # whose loc still passes through the wildcard segment as '*'
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_test({'authors': 'not-a-list'})
+    errors = exc_info.value.errors(include_url=False)
+    assert errors[0]['type'] == 'missing'
+    assert errors[0]['loc'] == ('authors', '*', 'name')
+
+
+def test_alias_path_wildcard_nested_error_loc(py_and_json: PyAndJson):
+    # with two wildcard segments, both must be rendered as '*' in the error loc, in order, followed
+    # by the nested item indices (outer list index, then inner list index) from schema validation
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['groups', ..., ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'list', 'items_schema': {'type': 'str'}}},
+                }
+            },
+        },
+        {'loc_by_alias': True},
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_test({'groups': [[{'name': 'A'}, {'name': 123}]]})
+    errors = exc_info.value.errors(include_url=False)
+    assert errors[0]['type'] == 'string_type'
+    assert errors[0]['loc'] == ('groups', '*', '*', 'name', 0, 1)
+
+
+@pytest.mark.parametrize('required', [True, False])
+def test_alias_path_wildcard_nested_non_sequence_omitted(py_and_json: PyAndJson, required):
+    # the outer wildcard resolves fine (one group), but that group's inner wildcard hits a
+    # non-sequence, so that single element is omitted per the standard omission rule - the field
+    # ends up with an empty list, for both a defaulted field and a required one (an empty list
+    # still satisfies a required list field, so no error is raised)
+    field_schema = {'type': 'list', 'items_schema': {'type': 'str'}}
+    if not required:
+        field_schema = {'type': 'default', 'schema': field_schema, 'default': None}
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['groups', ..., 'inner', ..., 'name'],
+                    'schema': field_schema,
+                }
+            },
+        }
+    )
+    assert v.validate_test({'groups': [{'inner': 'not-a-list'}]}) == ({'field_a': []}, None, {'field_a'})
+
+
+def test_alias_wildcard_extra_forbid(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}) == (
+        {'field_a': ['Alice', 'Bob']},
+        None,
+        {'field_a'},
+    )
+
+
+def test_alias_wildcard_extra_allow(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'allow',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'Alice'}]}) == ({'field_a': ['Alice']}, {}, {'field_a'})
+
+
+def test_alias_choices_wildcard_extra_forbid(py_and_json: PyAndJson):
+    # regression test: once a field has *any* wildcard alias, none of its lookup paths (including
+    # non-wildcard alias choices and its plain name) are tracked by the fast-path `LookupTree`, so all
+    # of their root keys need to be excluded from "extra" detection, not just the wildcard one.
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['writers'], ['authors', ..., 'name']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'writers': ['X', 'Y']}) == ({'field_a': ['X', 'Y']}, None, {'field_a'})
+    assert v.validate_test({'authors': [{'name': 'A'}]}) == ({'field_a': ['A']}, None, {'field_a'})
+
+
+def test_alias_choices_wildcard_extra_allow_surfaces_unused_root(py_and_json: PyAndJson):
+    # under extra='allow', a wildcard choice's root key that goes unused because a different choice
+    # resolved instead must still surface as an extra field, exactly as if it had never been exempted
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'allow',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['writers'], ['authors', ..., 'name']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'writers': ['X'], 'authors': [{'name': 'A'}]}) == (
+        {'field_a': ['X']},
+        {'authors': [{'name': 'A'}]},
+        {'field_a', 'authors'},
+    )
+
+
+def test_alias_choices_wildcard_extra_allow_surfaces_unused_root_through_extras_validator(py_and_json: PyAndJson):
+    # regression test: a deferred wildcard/choice root that surfaces as an extra under
+    # extra='allow' must still go through the configured extras_schema validator (coercion,
+    # potential validation errors) exactly like an ordinary extra does - not be inserted as its
+    # raw, unvalidated value just because its "is this actually used" decision was deferred until
+    # after the wildcard-field loop
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'allow',
+            'extras_schema': {'type': 'int'},
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['writers'], ['authors', ..., 'name']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'writers': ['X'], 'authors': '7'}) == (
+        {'field_a': ['X']},
+        {'authors': 7},
+        {'field_a', 'authors'},
+    )
+
+
+def test_alias_choices_wildcard_extra_allow_surfaces_unused_plain_root_when_wildcard_wins(py_and_json: PyAndJson):
+    # the reverse of the test above: when the wildcard choice is listed first and wins, the losing
+    # plain choice's root key must still surface as an extra field too - the exemption applies
+    # symmetrically to every choice's root, not just to a wildcard root specifically
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'allow',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['authors', ..., 'name'], ['writers']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'A'}], 'writers': ['X']}) == (
+        {'field_a': ['A']},
+        {'writers': ['X']},
+        {'field_a', 'writers'},
+    )
+
+
+def test_alias_choices_wildcard_extra_forbid_multiple_wildcards(py_and_json: PyAndJson):
+    # regression test: with more than one wildcard choice (plus a plain one), every choice's root
+    # key must be excluded from "extra" detection, not just a single special-cased wildcard root
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [
+                        ['authors', ..., 'name'],
+                        ['editors', ..., 'name'],
+                        ['writers'],
+                    ],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'A'}]}) == ({'field_a': ['A']}, None, {'field_a'})
+    assert v.validate_test({'editors': [{'name': 'E'}]}) == ({'field_a': ['E']}, None, {'field_a'})
+    assert v.validate_test({'writers': ['W']}) == ({'field_a': ['W']}, None, {'field_a'})
+
+
+def test_alias_choices_wildcard_extra_forbid_co_present_roots(py_and_json: PyAndJson):
+    # regression test: a broken implementation might compute the extra-forbid exemption from
+    # "was this specific root actually used" rather than "is this root declared as a choice on a
+    # wildcard-bearing field" - those two only differ when more than one choice's root is present
+    # at once, which no other test exercises (they only ever supply a single root). Here both the
+    # winning wildcard root and a losing, unused plain root are present together; the losing root
+    # must still be exempt, not flagged as extra_forbidden just because it wasn't the one used.
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': [['authors', ..., 'name'], ['writers']],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        }
+    )
+    assert v.validate_test({'authors': [{'name': 'A'}], 'writers': ['W']}) == (
+        {'field_a': ['A']},
+        None,
+        {'field_a'},
+    )
+
+
+def test_alias_wildcard_extra_forbid_by_name(py_and_json: PyAndJson):
+    # regression test: the plain field name is also excluded from the `LookupTree` once the field has a
+    # wildcard alias, so it must be excluded from "extra" detection too
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        },
+        config=CoreConfig(validate_by_name=True),
+    )
+    assert v.validate_test({'field_a': ['Alice']}) == ({'field_a': ['Alice']}, None, {'field_a'})
+
+
+def test_alias_wildcard_extra_forbid_by_name_when_validate_by_name_disabled(py_and_json: PyAndJson):
+    # regression test: the plain field name is exempt from extra='forbid' unconditionally, not
+    # just when by-name lookup is enabled and actually consumes it - with validate_by_name
+    # disabled and the alias's own root absent, the plain name is present but genuinely unused,
+    # and must still not be flagged as extra
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'extra_behavior': 'forbid',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {
+                        'type': 'default',
+                        'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                        'default': [],
+                    },
+                }
+            },
+        },
+        config=CoreConfig(validate_by_name=False),
+    )
+    assert v.validate_test({'field_a': ['Alice']}) == ({'field_a': []}, None, set())
+
+
+def test_alias_wildcard_validate_by_name_only(py_and_json: PyAndJson):
+    v = py_and_json(
+        {
+            'type': 'model-fields',
+            'fields': {
+                'field_a': {
+                    'type': 'model-field',
+                    'validation_alias': ['authors', ..., 'name'],
+                    'schema': {'type': 'list', 'items_schema': {'type': 'str'}},
+                }
+            },
+        },
+        config=CoreConfig(validate_by_alias=False, validate_by_name=True),
+    )
+    assert v.validate_test({'field_a': ['Alice', 'Bob']}) == ({'field_a': ['Alice', 'Bob']}, None, {'field_a'})
+    with pytest.raises(ValidationError, match=r'field_a\n +Field required \[type=missing,'):
+        v.validate_test({'authors': [{'name': 'Alice'}]})
 
 
 def test_alias_error_loc_field_names(py_and_json: PyAndJson):

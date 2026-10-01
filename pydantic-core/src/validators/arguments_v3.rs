@@ -12,17 +12,18 @@ use pyo3::IntoPyObjectExt;
 use crate::build_tools::py_schema_err;
 use crate::build_tools::{ExtraBehavior, schema_or_config_same};
 use crate::errors::LocItem;
-use crate::errors::{ErrorTypeDefaults, ValError, ValLineError, ValResult};
+use crate::errors::{ErrorType, ErrorTypeDefaults, ValError, ValLineError, ValResult};
 use crate::input::ConsumeIterator;
 use crate::input::{
     Arguments, BorrowInput, Input, KeywordArgs, PositionalArgs, ValidatedDict, ValidatedTuple, ValidationMatch,
 };
 use crate::lookup_key::LookupPathCollection;
 use crate::lookup_key::LookupType;
+use crate::lookup_key::PathItemString;
 use crate::tools::SchemaDict;
 
 use super::validation_state::ValidationState;
-use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, Validator, build_validator};
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, Validator, build_validator, typed_dict};
 
 #[derive(Debug, PartialEq)]
 enum ParameterMode {
@@ -73,6 +74,10 @@ pub struct ArgumentsV3Validator {
     positional_params_count: usize,
     loc_by_alias: bool,
     extra: ExtraBehavior,
+    /// Root keys of parameters which have a wildcard alias; under `extra='forbid'` these must be
+    /// excluded from "extra" detection even when the particular key present in a given input didn't
+    /// resolve via that parameter (e.g. another alias choice, or the plain name, resolved instead).
+    wildcard_extra_exempt_keys: AHashSet<PathItemString>,
     validate_by_alias: Option<bool>,
     validate_by_name: Option<bool>,
 }
@@ -203,11 +208,18 @@ impl BuildValidator for ArgumentsV3Validator {
             })
             .count();
 
+        let wildcard_extra_exempt_keys: AHashSet<PathItemString> = parameters
+            .iter()
+            .filter(|param| param.lookup_path_collection.has_wildcard())
+            .flat_map(|param| param.lookup_path_collection.root_keys().cloned())
+            .collect();
+
         Ok(CombinedValidator::ArgumentsV3(Self {
             parameters,
             positional_params_count,
             loc_by_alias: config.get_as(intern!(py, "loc_by_alias"))?.unwrap_or(true),
             extra: ExtraBehavior::from_schema_or_config(py, schema, config, ExtraBehavior::Forbid)?,
+            wildcard_extra_exempt_keys,
             validate_by_alias: schema_or_config_same(schema, config, intern!(py, "validate_by_alias"))?,
             validate_by_name: schema_or_config_same(schema, config, intern!(py, "validate_by_name"))?,
         })
@@ -437,6 +449,7 @@ impl ArgumentsV3Validator {
         if let Some(used_keys) = used_keys {
             struct ValidateExtra<'a> {
                 used_keys: AHashSet<&'a str>,
+                wildcard_extra_exempt_keys: &'a AHashSet<PathItemString>,
                 errors: &'a mut Vec<ValLineError>,
                 extra_behavior: ExtraBehavior,
             }
@@ -468,7 +481,10 @@ impl ArgumentsV3Validator {
                             Err(err) => return Err(err),
                         };
                         let cow = either_str.as_cow()?;
-                        if self.used_keys.contains(cow.as_ref()) {
+                        if self.used_keys.contains(cow.as_ref())
+                            || (self.extra_behavior == ExtraBehavior::Forbid
+                                && self.wildcard_extra_exempt_keys.contains(cow.as_ref()))
+                        {
                             continue;
                         }
 
@@ -489,6 +505,7 @@ impl ArgumentsV3Validator {
 
             mapping.iterate(ValidateExtra {
                 used_keys,
+                wildcard_extra_exempt_keys: &self.wildcard_extra_exempt_keys,
                 errors: &mut errors,
                 extra_behavior,
             })??;
@@ -672,7 +689,9 @@ impl ArgumentsV3Validator {
 
                     match maybe_var_kwargs_parameter {
                         None => {
-                            if extra_behavior == ExtraBehavior::Forbid {
+                            if extra_behavior == ExtraBehavior::Forbid
+                                && !self.wildcard_extra_exempt_keys.contains(either_str.as_cow()?.as_ref())
+                            {
                                 errors.push(ValLineError::new_with_loc(
                                     ErrorTypeDefaults::UnexpectedKeywordArgument,
                                     value,
@@ -697,7 +716,10 @@ impl ArgumentsV3Validator {
                                     }
                                 }
                                 ParameterMode::VarKwargsUnpackedTypedDict => {
-                                    // Save to the remaining kwargs, we will validate as a single dict:
+                                    // Save to the remaining kwargs, we will validate as a single dict. A
+                                    // wildcard-exempt key is still forwarded here (it may be a legitimately
+                                    // declared field of the inner TypedDict), but any `extra_forbidden` error
+                                    // the inner validator raises for it is filtered out below.
                                     remaining_kwargs.set_item(
                                         either_str.as_py_string(py, state.cache_str()),
                                         value.borrow_input().to_object(py)?,
@@ -717,15 +739,77 @@ impl ArgumentsV3Validator {
             .find(|p| p.mode == ParameterMode::VarKwargsUnpackedTypedDict);
 
         if let Some(var_kwargs_parameter) = maybe_var_kwargs_parameter {
-            match var_kwargs_parameter
-                .validator
-                .validate(py, remaining_kwargs.as_any(), state)
-            {
+            let var_kwargs_validator = &var_kwargs_parameter.validator;
+
+            // Proactively drop wildcard-exempt keys that can't possibly be genuine fields of
+            // the inner TypedDict, so the single validation call below doesn't fail solely
+            // because of them - this avoids retrying (and hence double-invoking sibling field
+            // validators) in the common case. A key that *is* a genuine field is left alone:
+            // consuming it normally never raises `extra_forbidden` in the first place. Only
+            // relevant when the inner TypedDict would itself forbid the key: under allow/ignore
+            // it raises no error to suppress, and dropping it here would just discard data the
+            // inner TypedDict was supposed to surface (as an extra) or ignore on its own.
+            // `resolve_typed_dict` sees through a `DefinitionRef` indirection too (as used by
+            // `definitions_schema`/`definition_reference_schema`), not just a directly-embedded
+            // TypedDict - otherwise this would silently fall back to the retrying path below.
+            typed_dict::resolve_typed_dict(var_kwargs_validator, |maybe_td| {
+                let Some(td) = maybe_td else { return };
+                let mut keys_to_remove: Vec<Py<PyAny>> = Vec::new();
+                for (key, _value) in remaining_kwargs.iter() {
+                    if let Ok(key_str) = key.extract::<PyBackedStr>()
+                        && self.wildcard_extra_exempt_keys.contains(&*key_str)
+                        && !td.declares_root_key(&key_str)
+                        && td.effective_extra_behavior(state) == ExtraBehavior::Forbid
+                    {
+                        keys_to_remove.push(key.unbind());
+                    }
+                }
+                for key in keys_to_remove {
+                    remaining_kwargs.del_item(key).ok();
+                }
+            });
+
+            match var_kwargs_validator.validate(py, remaining_kwargs.as_any(), state) {
                 Ok(value) => {
                     output_kwargs.update(value.cast_bound::<PyDict>(py).unwrap().as_mapping())?;
                 }
                 Err(ValError::LineErrors(line_errors)) => {
-                    errors.extend(line_errors);
+                    let (exempt, other): (Vec<ValLineError>, Vec<ValLineError>) = line_errors
+                        .into_iter()
+                        .partition(|err| self.is_exempt_extra_forbidden(err));
+                    if other.is_empty() && !exempt.is_empty() {
+                        // Fallback: only reachable when `var_kwargs_validator` isn't a `TypedDict`
+                        // at all, even through a `DefinitionRef` (so `resolve_typed_dict` above
+                        // couldn't run the proactive strip), and the only
+                        // problems were wildcard-exempt keys' own extra_forbidden errors - the
+                        // inner validator has no notion of "partial success", so retry without
+                        // those keys to recover genuinely valid sibling keys instead of
+                        // discarding them along with the suppressed error. This re-invokes any
+                        // sibling field validators a second time, unlike the common path above.
+                        for err in &exempt {
+                            let key: &str = match err.first_loc_item() {
+                                Some(LocItem::S(s)) => s.as_str(),
+                                Some(LocItem::PyS(s)) => s,
+                                _ => continue,
+                            };
+                            remaining_kwargs.del_item(key).ok();
+                        }
+                        match var_kwargs_validator.validate(py, remaining_kwargs.as_any(), state) {
+                            Ok(value) => {
+                                output_kwargs.update(value.cast_bound::<PyDict>(py).unwrap().as_mapping())?;
+                            }
+                            Err(ValError::LineErrors(retry_errors)) => {
+                                errors.extend(
+                                    retry_errors
+                                        .into_iter()
+                                        .filter(|err| !self.is_exempt_extra_forbidden(err)),
+                                );
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        errors.extend(other);
+                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -762,5 +846,26 @@ impl Validator for ArgumentsV3Validator {
 
     fn get_name(&self) -> &str {
         Self::EXPECTED_TYPE
+    }
+}
+
+impl ArgumentsV3Validator {
+    /// Whether `err` is an `extra_forbidden` error raised by the inner unpacked-TypedDict
+    /// validator for a key that's exempt here as a wildcard alias root - such an error must be
+    /// suppressed, since the exemption is unconditional regardless of which validator raised it.
+    fn is_exempt_extra_forbidden(&self, err: &ValLineError) -> bool {
+        // must be exactly the "this key itself is extra" error, not a genuinely nested
+        // `extra_forbidden` for some sub-key of a declared field that happens to share its name
+        // with an exempt root (e.g. `authors.unexpected_nested_key`) - only a single-segment
+        // location identifies the former.
+        if err.location.len() != 1 || !matches!(err.error_type, ErrorType::ExtraForbidden { .. }) {
+            return false;
+        }
+        let key: &str = match err.first_loc_item() {
+            Some(LocItem::S(s)) => s.as_str(),
+            Some(LocItem::PyS(s)) => s,
+            _ => return false,
+        };
+        self.wildcard_extra_exempt_keys.contains(key)
     }
 }

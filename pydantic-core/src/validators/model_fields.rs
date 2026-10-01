@@ -18,6 +18,7 @@ use crate::input::ConsumeIterator;
 use crate::input::{BorrowInput, Input, ValidatedDict, ValidationMatch};
 use crate::lookup_key::LookupPathCollection;
 use crate::lookup_key::LookupType;
+use crate::lookup_key::PathItemString;
 use crate::tools::SchemaDict;
 use crate::tools::new_py_string;
 use crate::validators::shared::lookup_tree::LookupFieldInfo;
@@ -46,6 +47,10 @@ pub struct ModelFieldsValidator {
     from_attributes: bool,
     loc_by_alias: bool,
     lookup: LookupTree,
+    /// Root keys of fields which have a wildcard alias, and so are excluded from `lookup`; these keys
+    /// must be excluded from "extra" detection too, even when the particular key present in a given
+    /// input didn't resolve via that field (see `validate_json_by_iteration`).
+    wildcard_extra_exempt_keys: AHashSet<PathItemString>,
     validate_by_alias: Option<bool>,
     validate_by_name: Option<bool>,
 }
@@ -107,6 +112,12 @@ impl BuildValidator for ModelFieldsValidator {
 
         let lookup = LookupTree::from_fields(&fields, |field| &field.lookup_path_collection);
 
+        let wildcard_extra_exempt_keys: AHashSet<PathItemString> = fields
+            .iter()
+            .filter(|field| field.lookup_path_collection.has_wildcard())
+            .flat_map(|field| field.lookup_path_collection.root_keys().cloned())
+            .collect();
+
         Ok(CombinedValidator::ModelFields(Self {
             fields,
             model_name,
@@ -117,6 +128,7 @@ impl BuildValidator for ModelFieldsValidator {
             from_attributes,
             loc_by_alias: config.get_as(intern!(py, "loc_by_alias"))?.unwrap_or(true),
             lookup,
+            wildcard_extra_exempt_keys,
             validate_by_alias: config.get_as(intern!(py, "validate_by_alias"))?,
             validate_by_name: config.get_as(intern!(py, "validate_by_name"))?,
         })
@@ -411,6 +423,7 @@ impl ModelFieldsValidator {
             struct ValidateToModelExtra<'a, 's, 'py> {
                 py: Python<'py>,
                 used_keys: AHashSet<&'a str>,
+                wildcard_extra_exempt_keys: &'a AHashSet<PathItemString>,
                 errors: &'a mut Vec<ValLineError>,
                 fields_set_vec: &'a mut Vec<PyBackedStr>,
                 extra_behavior: ExtraBehavior,
@@ -450,7 +463,10 @@ impl ModelFieldsValidator {
                             Err(err) => return Err(err),
                         };
                         let cow = either_str.as_cow()?;
-                        if self.used_keys.contains(cow.as_ref()) {
+                        if self.used_keys.contains(cow.as_ref())
+                            || (self.extra_behavior == ExtraBehavior::Forbid
+                                && self.wildcard_extra_exempt_keys.contains(cow.as_ref()))
+                        {
                             continue;
                         }
 
@@ -509,6 +525,7 @@ impl ModelFieldsValidator {
             let model_extra_dict = dict.iterate(ValidateToModelExtra {
                 py,
                 used_keys,
+                wildcard_extra_exempt_keys: &self.wildcard_extra_exempt_keys,
                 errors: &mut errors,
                 fields_set_vec: &mut fields_set_vec,
                 extra_behavior,
@@ -565,6 +582,11 @@ impl ModelFieldsValidator {
         let state = &mut state.scoped_clear_field_error();
 
         let model_extra_dict = PyDict::new(py);
+        // keys exempted from "extra" below because they're the root of a wildcard-having field, but
+        // whose value we haven't resolved as *actually used* by that field yet - only relevant to
+        // extra='allow', where an exempted-but-ultimately-unresolved key must still show up as extra
+        // (unlike extra='forbid', where the exemption is unconditional regardless of resolution)
+        let mut pending_wildcard_allow_keys: Vec<(&str, &JsonValue)> = Vec::new();
         for (key, value) in &**json_object {
             let mut handled = false;
             let key = key.as_ref();
@@ -593,6 +615,17 @@ impl ModelFieldsValidator {
                 continue;
             }
 
+            if self.wildcard_extra_exempt_keys.contains(key) {
+                // this key may be consumed by a wildcard field below, resolved separately since
+                // wildcard paths can't be represented in `self.lookup`. Under forbid this is an
+                // unconditional exemption; under allow we don't yet know if it'll actually be used,
+                // so defer the decision until after the wildcard-field loop below.
+                if matches!(extra_behavior, ExtraBehavior::Allow) {
+                    pending_wildcard_allow_keys.push((key, value));
+                }
+                continue;
+            }
+
             // Unknown / extra field - we currently only care about these at the top level
             match extra_behavior {
                 ExtraBehavior::Forbid => {
@@ -604,33 +637,95 @@ impl ModelFieldsValidator {
                 }
                 ExtraBehavior::Ignore => {}
                 ExtraBehavior::Allow => {
-                    let py_key: Bound<'_, PyString> = new_py_string(py, key, state.cache_str());
-                    if let Some(validator) = &self.extras_validator {
-                        match validator.validate(py, value, state) {
-                            Ok(value) => {
-                                model_extra_dict.set_item(&py_key, value)?;
-                                fields_set.add(py_key)?;
-                            }
-                            Err(ValError::LineErrors(line_errors)) => {
-                                for err in line_errors {
-                                    errors.push(err.with_outer_location(key));
-                                }
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    } else {
-                        model_extra_dict.set_item(&py_key, value)?;
-                        fields_set.add(py_key)?;
-                    }
+                    Self::add_json_extra_value(
+                        py,
+                        key,
+                        value,
+                        self.extras_validator.as_deref(),
+                        &model_extra_dict,
+                        &fields_set,
+                        &mut errors,
+                        state,
+                    )?;
                 }
             }
         }
 
         // now that we've iterated over all the keys, we can set the values in the model
-        // dict, and try to set defaults for any missing fields
+        // dict, and try to set defaults for any missing fields, in declaration order - this matters
+        // because a validator/default for a later field may read previously-set fields via `info.data`
+
+        let mut used_wildcard_roots: AHashSet<&str> = AHashSet::new();
 
         for (field, field_result) in std::iter::zip(&self.fields, field_results) {
             let state = &mut state.scoped_set_field_name(Some(field.name.as_py_str().bind(py).clone()));
+
+            if field.lookup_path_collection.has_wildcard() {
+                // wildcard fields aren't (and can't be) represented in `self.lookup`/`field_results`,
+                // so resolve them individually here, the same way the general (non-JSON) lookup path
+                // does - but still in this same declaration-order loop, so `info.data` sees exactly
+                // the fields it would for non-JSON input at the same point
+                if let Some((lookup_path, lookup_result)) = field
+                    .lookup_path_collection
+                    .lookup_paths(lookup_type)
+                    .find_map(|path| Some((path, json_object.get_item(path).transpose()?)))
+                {
+                    // key is "used" whether or not validation passes, since we want to skip this key
+                    // in extra logic either way
+                    used_wildcard_roots.insert(lookup_path.first_key());
+
+                    let value = match lookup_result {
+                        Ok(value) => value,
+                        Err(ValError::LineErrors(line_errors)) => {
+                            for err in line_errors {
+                                errors.push(err.with_outer_location(field.name.clone()));
+                            }
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+
+                    match field.validator.validate(py, value.borrow_input(), state) {
+                        Ok(value) => {
+                            model_dict.set_item(&field.name, value)?;
+                            fields_set.add(&field.name)?;
+                            fields_set_count += 1;
+                        }
+                        Err(e) => {
+                            state.has_field_error = true;
+                            match e {
+                                ValError::Omit => {}
+                                ValError::LineErrors(line_errors) => {
+                                    for err in line_errors {
+                                        errors.push(lookup_path.apply_error_loc(err, self.loc_by_alias, &field.name));
+                                    }
+                                }
+                                err => return Err(err),
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                match field.validator.default_value(py, Some(field.name.clone()), state) {
+                    Ok(Some(value)) => {
+                        model_dict.set_item(&field.name, value)?;
+                    }
+                    Ok(None) => {
+                        state.has_field_error = true;
+                        let error_type = ErrorTypeDefaults::Missing;
+                        let error_loc = field.lookup_path_collection.error_loc(lookup_type, self.loc_by_alias);
+                        errors.push(ValLineError::new_with_full_loc(error_type, json_input, error_loc));
+                    }
+                    Err(ValError::Omit) => {}
+                    Err(ValError::LineErrors(line_errors)) => {
+                        state.has_field_error = true;
+                        errors.extend(line_errors);
+                    }
+                    Err(err) => return Err(err),
+                }
+                continue;
+            }
 
             let field_value = if let Some((field_info, field_json_value)) = field_result {
                 match field.validator.validate(py, field_json_value, state) {
@@ -690,6 +785,30 @@ impl ModelFieldsValidator {
             model_dict.set_item(&field.name, field_value)?;
         }
 
+        // reconcile deferred wildcard-root keys: under extra='allow', any that weren't actually
+        // consumed by a wildcard field above must still surface as extra, exactly as if they'd
+        // never been exempted - including seeing the same (empty) `info.data` an ordinary extra
+        // sees, since ordinary extras are validated in the loop above, before any field has been
+        // resolved. Use a fresh, empty data scope here rather than the real `state` (which by now
+        // holds whatever fields the loop above already resolved) to match that.
+        if !pending_wildcard_allow_keys.is_empty() {
+            let reconciliation_state = &mut state.scoped_set_data(Some(PyDict::new(py)));
+            for (key, value) in pending_wildcard_allow_keys {
+                if !used_wildcard_roots.contains(key) {
+                    Self::add_json_extra_value(
+                        py,
+                        key,
+                        value,
+                        self.extras_validator.as_deref(),
+                        &model_extra_dict,
+                        &fields_set,
+                        &mut errors,
+                        reconciliation_state,
+                    )?;
+                }
+            }
+        }
+
         if matches!(extra_behavior, ExtraBehavior::Allow) {
             model_extra_dict_op = Some(model_extra_dict);
         }
@@ -700,5 +819,40 @@ impl ModelFieldsValidator {
 
         state.add_fields_set(fields_set_count);
         Ok((model_dict, model_extra_dict_op, fields_set))
+    }
+
+    /// Adds a JSON key/value pair to `model_extra_dict` under `extra='allow'`, running it through
+    /// `extras_validator` if one is configured. Shared between the main per-key loop and the deferred
+    /// wildcard-root reconciliation pass in `validate_json_by_iteration`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_json_extra_value<'py>(
+        py: Python<'py>,
+        key: &str,
+        value: &JsonValue,
+        extras_validator: Option<&CombinedValidator>,
+        model_extra_dict: &Bound<'py, PyDict>,
+        fields_set: &Bound<'py, PySet>,
+        errors: &mut Vec<ValLineError>,
+        state: &mut ValidationState<'_, 'py>,
+    ) -> ValResult<()> {
+        let py_key: Bound<'_, PyString> = new_py_string(py, key, state.cache_str());
+        if let Some(validator) = extras_validator {
+            match validator.validate(py, value, state) {
+                Ok(value) => {
+                    model_extra_dict.set_item(&py_key, value)?;
+                    fields_set.add(py_key)?;
+                }
+                Err(ValError::LineErrors(line_errors)) => {
+                    for err in line_errors {
+                        errors.push(err.with_outer_location(key));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            model_extra_dict.set_item(&py_key, value)?;
+            fields_set.add(py_key)?;
+        }
+        Ok(())
     }
 }

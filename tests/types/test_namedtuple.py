@@ -1,11 +1,22 @@
+import json
 from collections import namedtuple
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Generic, NamedTuple, Optional, TypeVar
 
 import pytest
 from typing_extensions import NamedTuple as TypingExtensionsNamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, PositiveInt, TypeAdapter, ValidationError
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    PositiveInt,
+    TypeAdapter,
+    ValidationError,
+)
 from pydantic.errors import PydanticSchemaGenerationError
 
 
@@ -432,6 +443,78 @@ def test_namedtuple_validation_alias():
         {'type': 'missing', 'loc': ('ex',), 'msg': 'Field required', 'input': {'x': 1, 'y': 2}},
         {'type': 'extra_forbidden', 'loc': ('x',), 'msg': 'Extra inputs are not permitted', 'input': 1},
     ]
+
+
+def test_namedtuple_wildcard_alias():
+    class Model(NamedTuple):
+        authors: Annotated[list[str], Field(validation_alias=AliasPath('authors', ..., 'name'))]
+
+    ta = TypeAdapter(Model)
+    data = {'authors': [{'name': 'Alice'}, {'name': 'Bob'}]}
+    assert ta.validate_python(data) == Model(authors=['Alice', 'Bob'])
+    assert ta.validate_json(json.dumps(data)) == Model(authors=['Alice', 'Bob'])
+    # the wildcard root key is consumed by the alias and must not be flagged as an extra by
+    # named-tuple's always-on extra-forbid-for-dict-input behavior
+
+
+def test_namedtuple_wildcard_alias_choice_unused_root_not_extra():
+    # regression test: a wildcard root that goes *unused* because a different AliasChoices
+    # choice resolved instead must still be exempted from named-tuple's always-on extra-forbid
+    # check, not just a wildcard root that ends up consumed
+    class Model(NamedTuple):
+        names: Annotated[list[str], Field(validation_alias=AliasChoices('writers', AliasPath('authors', ..., 'name')))]
+
+    ta = TypeAdapter(Model)
+    data = {'writers': ['X'], 'authors': [{'name': 'A'}]}
+    assert ta.validate_python(data) == Model(names=['X'])
+    assert ta.validate_json(json.dumps(data)) == Model(names=['X'])
+
+
+def test_namedtuple_wildcard_extra_forbid_by_name_when_validate_by_name_disabled():
+    # regression test: the plain field name is exempt from named-tuple's always-on extra-forbid
+    # unconditionally, not just when by-name lookup is enabled and actually consumes it - with
+    # validate_by_name disabled and the alias's own root absent, the plain name is present but
+    # genuinely unused, and must still not be flagged as extra
+    class Model(NamedTuple):
+        field_a: Annotated[list[str], Field(validation_alias=AliasPath('authors', ..., 'name'))] = []
+
+    ta = TypeAdapter(Model, config=ConfigDict(validate_by_name=False))
+    data = {'field_a': ['Alice']}
+    assert ta.validate_python(data) == Model(field_a=[])
+    assert ta.validate_json(json.dumps(data)) == Model(field_a=[])
+
+
+def test_namedtuple_wildcard_non_sequence_value_is_absent():
+    # if the wildcard value is not a sequence, the whole path is absent rather than raising - a
+    # required field with no default therefore reports an ordinary missing error, not a crash
+    class Model(NamedTuple):
+        authors: Annotated[list[str], Field(validation_alias=AliasPath('authors', ..., 'name'))]
+
+    ta = TypeAdapter(Model)
+    with pytest.raises(ValidationError) as exc_info:
+        ta.validate_python({'authors': 'not-a-sequence'})
+    assert exc_info.value.errors(include_url=False)[0]['type'] == 'missing'
+
+
+def test_namedtuple_wildcard_sequence_enumeration_exception_propagates():
+    # a genuine exception raised while enumerating a custom Sequence found at the wildcard
+    # position itself (not just a plain lookup miss) must propagate too, exactly like any other
+    # segment of the path - it must not be swallowed into "value absent"
+    class RaisingSequence(Sequence):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            if index == 1:
+                raise RuntimeError('boom')
+            return {'name': 'Alice'}
+
+    class Model(NamedTuple):
+        authors: Annotated[list[str], Field(validation_alias=AliasPath('authors', ..., 'name'))]
+
+    ta = TypeAdapter(Model)
+    with pytest.raises(RuntimeError, match='boom'):
+        ta.validate_python({'authors': RaisingSequence()})
 
 
 def test_namedtuple_mapping_input():

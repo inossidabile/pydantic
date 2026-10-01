@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from types import EllipsisType
 from typing import Any, Literal
 
 from pydantic_core import PydanticUndefined
@@ -19,16 +20,18 @@ class AliasPath:
     A data class used by `validation_alias` as a convenience to create aliases.
 
     Attributes:
-        path: A list of string or integer aliases.
+        path: A list of string or integer aliases, or `...` (`Ellipsis`) segments. `...` acts as a
+            wildcard that maps the remaining path over every item of the sequence found there - see
+            [`search_dict_for_path`][pydantic.aliases.AliasPath.search_dict_for_path] for details.
     """
 
-    path: list[int | str]
+    path: list[int | str | EllipsisType]
 
-    def __init__(self, first_arg: str, *args: str | int) -> None:
+    def __init__(self, first_arg: str, *args: str | int | EllipsisType) -> None:
         self.path = [first_arg] + list(args)
 
-    def convert_to_aliases(self) -> list[str | int]:
-        """Converts arguments to a list of string or integer aliases.
+    def convert_to_aliases(self) -> list[str | int | EllipsisType]:
+        """Converts arguments to a list of string or integer aliases, or `...` (`Ellipsis`) segments.
 
         Returns:
             The list of aliases.
@@ -38,11 +41,18 @@ class AliasPath:
     def search_dict_for_path(self, d: dict) -> Any:
         """Searches a dictionary for the path specified by the alias.
 
+        A `...` (`Ellipsis`) segment acts as a wildcard: the remaining path is mapped over every item
+        of the sequence found there (a bare trailing `...` returns each item unchanged), and items for
+        which the remaining path can't be resolved are omitted rather than causing the whole lookup to
+        fail. If the value at a wildcard position isn't a sequence, the lookup is treated as not found.
+
         Returns:
             The value at the specified path, or `PydanticUndefined` if the path is not found.
         """
         v = d
-        for k in self.path:
+        for i, k in enumerate(self.path):
+            if k is ...:
+                return _resolve_wildcard_path(v, self.path[i:])
             if isinstance(v, str):
                 # disallow indexing into a str, like for AliasPath('x', 0) and x='abc'
                 return PydanticUndefined
@@ -51,6 +61,45 @@ class AliasPath:
             except (KeyError, IndexError, TypeError):
                 return PydanticUndefined
         return v
+
+
+def _resolve_wildcard_path(value: Any, rest: list[int | str | EllipsisType]) -> Any:
+    """Resolves `rest` (whose first element must be `...`) against `value`, forking at each wildcard
+    segment by mapping the remaining path over every item of the sequence found there. Items for which
+    the remaining path can't be resolved are omitted rather than causing the whole lookup to fail.
+    """
+    if not rest:
+        return value
+    first, remaining = rest[0], rest[1:]
+    if first is ...:
+        items = _wildcard_items(value)
+        if items is None:
+            return PydanticUndefined
+        resolved = [
+            r for item in items if (r := _resolve_wildcard_path(item, remaining)) is not PydanticUndefined
+        ]
+        return resolved
+    if isinstance(value, str):
+        return PydanticUndefined
+    try:
+        next_value = value[first]
+    except (KeyError, IndexError, TypeError):
+        return PydanticUndefined
+    return _resolve_wildcard_path(next_value, remaining)
+
+
+def _wildcard_items(value: Any) -> list[Any] | None:
+    """If `value` isn't a sequence, it's not found (not an error) - we never want to iterate over e.g.
+    strings, bytes, bytearrays or mappings as if they were a sequence of items.
+
+    Enumerates via an explicit `len()` followed by indexing, rather than `list(value)`, so that any
+    exception raised by `__len__` propagates unconditionally - `list()` would otherwise swallow a
+    `TypeError` from `__len__` internally (via `operator.length_hint`), unlike the core validator.
+    """
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        return None
+    length = len(value)
+    return [value[i] for i in range(length)]
 
 
 @dataclasses.dataclass(slots=True)
@@ -69,13 +118,13 @@ class AliasChoices:
     def __init__(self, first_choice: str | AliasPath, *choices: str | AliasPath) -> None:
         self.choices = [first_choice] + list(choices)
 
-    def convert_to_aliases(self) -> list[list[str | int]]:
+    def convert_to_aliases(self) -> list[list[str | int | EllipsisType]]:
         """Converts arguments to a list of lists containing string or integer aliases.
 
         Returns:
             The list of aliases.
         """
-        aliases: list[list[str | int]] = []
+        aliases: list[list[str | int | EllipsisType]] = []
         for c in self.choices:
             if isinstance(c, AliasPath):
                 aliases.append(c.convert_to_aliases())

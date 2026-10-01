@@ -52,6 +52,12 @@ impl DefinitionRefValidator {
     pub fn new(definition: DefinitionRef<Arc<CombinedValidator>>) -> Self {
         Self { definition }
     }
+
+    /// Exposes the wrapped validator generically, for a caller that needs to inspect what kind of
+    /// validator this reference actually points to (see `typed_dict::resolve_typed_dict`).
+    pub(crate) fn read<R>(&self, f: impl FnOnce(Option<&CombinedValidator>) -> R) -> R {
+        self.definition.read(|v| f(v.map(Arc::as_ref)))
+    }
 }
 
 impl BuildValidator for DefinitionRefValidator {
